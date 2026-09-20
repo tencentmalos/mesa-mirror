@@ -804,12 +804,29 @@ get_relative_ms(uint64_t abs_timeout_ns)
        */
       return -1;
 
-   uint64_t cur_time_ms = os_time_get_nano() / 1000000;
-   uint64_t abs_timeout_ms = abs_timeout_ns / 1000000;
-   if (abs_timeout_ms <= cur_time_ms)
+   uint64_t now = os_time_get_nano();
+   if (abs_timeout_ns <= now)
       return 0;
 
-   return abs_timeout_ms - cur_time_ms;
+   /* Keep positive sub-millisecond waits positive and avoid overflowing the
+    * signed timeout accepted by poll()/sync_wait().
+    */
+   uint64_t remaining_ms = (abs_timeout_ns - now + 999999) / 1000000;
+   return MIN2(remaining_ms, INT_MAX);
+}
+
+static VkResult
+poll_timestamp(int fd, unsigned int context_id, unsigned int timestamp)
+{
+   struct kgsl_cmdstream_readtimestamp_ctxtid read = {
+      .context_id = context_id,
+      .type = KGSL_TIMESTAMP_RETIRED,
+   };
+
+   if (safe_ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &read))
+      return VK_ERROR_DEVICE_LOST;
+
+   return timestamp_cmp(read.timestamp, timestamp) ? VK_SUCCESS : VK_TIMEOUT;
 }
 
 /* safe_ioctl is not enough as restarted waits would not adjust the timeout
@@ -824,23 +841,25 @@ wait_timestamp_safe(int fd,
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = context_id,
       .timestamp = timestamp,
-      .timeout = get_relative_ms(abs_timeout_ns),
    };
 
    while (true) {
+      wait.timeout = get_relative_ms(abs_timeout_ns);
+
+      /* KGSL interprets a zero WAITTIMESTAMP timeout as an infinite wait, not
+       * a poll. Query RETIRED instead, including after an interrupted wait's
+       * deadline expires. This also lets timeline GC retire completed points
+       * without blocking vkQueueSubmit or vkGetSemaphoreCounterValue.
+       */
+      if (wait.timeout == 0)
+         return poll_timestamp(fd, context_id, timestamp);
+
       int ret = ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
 
       if (ret == -1 && (errno == EINTR || errno == EAGAIN)) {
-         int timeout_ms = get_relative_ms(abs_timeout_ns);
-
-         /* update timeout to consider time that has passed since the start */
-         if (timeout_ms == 0)
-            return VK_TIMEOUT;
-
-         wait.timeout = timeout_ms;
+         continue;
       } else if (ret == -1) {
-         assert(errno == ETIMEDOUT);
-         return VK_TIMEOUT;
+         return errno == ETIMEDOUT ? VK_TIMEOUT : VK_ERROR_DEVICE_LOST;
       } else {
          return VK_SUCCESS;
       }
