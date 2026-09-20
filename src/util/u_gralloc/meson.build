@@ -33,6 +33,12 @@ endif
 
 if with_freedreno_vk or with_gallium_freedreno
   c_args_for_u_gralloc += '-DHAS_FREEDRENO'
+  if with_android_stub
+    files_u_gralloc += files('u_gralloc_qcom_mapper5.cpp')
+    c_args_for_u_gralloc += '-DUSE_QCOM_MAPPER5'
+    cpp_args_for_u_gralloc += '-DUSE_QCOM_MAPPER5'
+    options_for_u_gralloc += 'cpp_std=c++17'
+  endif
 endif
 
 _libmesa_u_gralloc = static_library(

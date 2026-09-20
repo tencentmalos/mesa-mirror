@@ -53,3 +53,35 @@ The build dynamically depends on the NDK `libc++_shared.so` and Android platform
 libraries; an app must supply a compatible C++ runtime and loader namespace.
 Do not install the Android stub libraries into the device. Check SHA-256 and
 ELF Build-ID of the exact library deployed for each device validation.
+
+## Mapper 5 metadata for standalone NDK builds
+
+The first app validation of the poll-only build failed: the fallback gralloc
+could not identify a modern QCOM native handle, left its modifier unknown, and
+presentation showed corruption and CCU write faults beyond the buffer allocation.
+The stable-C Mapper 5 HAL independently reported the same RGBA buffer as LINEAR,
+with a 7680-byte stride and 8,298,496-byte allocation (1920 × 1080).
+
+Standalone Android/Freedreno builds now try `/vendor/lib[64]/hw/mapper.qti.so`
+before legacy QCOM/fallback gralloc. Import/free uses the HAL's ownership protocol;
+standard FourCC, modifier, allocation, layer count and plane-layout metadata are
+queried and decoded with bounded reads. No private SnapAlloc handle offsets are
+used. Unsupported/malformed metadata fails rather than guessing a layout. This
+backend currently supports RGB; YUV color metadata/front-buffer usage remain
+unsupported. Platform libui/IMapper builds keep their existing backend priority;
+older QCOM devices without the stable-C HAL keep their legacy backend selection.
+
+The stub IMapper header is from the Apache-2.0 AOSP interface:
+<https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/main/graphics/mapper/stable-c/include/android/hardware/graphics/mapper/IMapper.h>
+Metadata encoding follows the AOSP StandardMetadataType / IMapperMetadataTypes
+contract. See <https://android.googlesource.com/platform/hardware/interfaces/+/main/graphics/mapper/stable-c/>.
+
+```sh
+c++ -std=c++17 -O2 src/util/u_gralloc/tests/mapper5_metadata_test.cpp -o /tmp/mapper5-test
+/tmp/mapper5-test
+```
+
+328 checks cover the actual decoder, all truncated lengths, wrong headers,
+trailing bytes, excessive collections/strings, invalid strides and allocation
+bounds. Real AHardwareBuffer import/properties and game validation are recorded
+separately for the exact deployed artifact; compilation is not WSI acceptance.

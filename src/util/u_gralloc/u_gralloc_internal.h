@@ -36,6 +36,9 @@ extern struct u_gralloc *u_gralloc_cros_api_create(void);
 extern struct u_gralloc *u_gralloc_imapper_api_create(void);
 #endif
 extern struct u_gralloc *u_gralloc_qcom_create(void);
+#ifdef USE_QCOM_MAPPER5
+extern struct u_gralloc *u_gralloc_qcom_mapper5_create(void);
+#endif
 extern struct u_gralloc *u_gralloc_libdrm_create(void);
 extern struct u_gralloc *u_gralloc_fallback_create(void);
 
