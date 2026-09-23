@@ -43,6 +43,7 @@
 #include "tu_query_pool.h"
 #include "tu_queue.h"
 #include "tu_rmv.h"
+#include "tu_subsampled_image.h"
 #include "tu_tracepoints.h"
 #include "tu_wsi.h"
 
@@ -355,6 +356,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_external_memory_dma_buf = true,
       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
       .EXT_fragment_density_map = true,
+      .EXT_fragment_density_map2 = true,
       .EXT_fragment_density_map_offset = true,
       .EXT_global_priority = tu_is_vk_1_1(device),
       .EXT_global_priority_query = tu_is_vk_1_1(device),
@@ -789,6 +791,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->fragmentDensityMap = true;
    features->fragmentDensityMapDynamic = false;
    features->fragmentDensityMapNonSubsampledImages = true;
+   features->fragmentDensityMapDeferred = false;
 
    /* VK_EXT_global_priority_query */
    features->globalPriorityQuery = true;
@@ -1519,6 +1522,10 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->minFragmentDensityTexelSize = (VkExtent2D) { MIN_FDM_TEXEL_SIZE, MIN_FDM_TEXEL_SIZE };
    props->maxFragmentDensityTexelSize = (VkExtent2D) { MAX_FDM_TEXEL_SIZE, MAX_FDM_TEXEL_SIZE };
    props->fragmentDensityInvocations = false;
+   props->subsampledLoads = false;
+   props->subsampledCoarseReconstructionEarlyAccess = false;
+   props->maxSubsampledArrayLayers = TU_SUBSAMPLED_MAX_LAYERS;
+   props->maxDescriptorSetSubsampledSamplers = max_descriptor_set_size / 3;
 
    /* VK_KHR_maintenance5 */
    props->earlyFragmentMultisampleCoverageAfterSampleCounting = true;
