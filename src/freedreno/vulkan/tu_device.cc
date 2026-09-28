@@ -43,6 +43,8 @@
 #include "tu_query_pool.h"
 #include "tu_queue.h"
 #include "tu_rmv.h"
+#include "tu_qcom_surface.h"
+#include "tu_subsampled_image.h"
 #include "tu_tracepoints.h"
 #include "tu_wsi.h"
 
@@ -52,6 +54,9 @@
 
 #if DETECT_OS_ANDROID
 #include <vndk/hardware_buffer.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #endif
 
 uint64_t os_page_size = 4096;
@@ -355,6 +360,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_external_memory_dma_buf = true,
       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
       .EXT_fragment_density_map = true,
+      .EXT_fragment_density_map2 = true,
       .EXT_fragment_density_map_offset = true,
       .EXT_global_priority = tu_is_vk_1_1(device),
       .EXT_global_priority_query = tu_is_vk_1_1(device),
@@ -789,6 +795,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->fragmentDensityMap = true;
    features->fragmentDensityMapDynamic = false;
    features->fragmentDensityMapNonSubsampledImages = true;
+   features->fragmentDensityMapDeferred = false;
 
    /* VK_EXT_global_priority_query */
    features->globalPriorityQuery = true;
@@ -1519,6 +1526,10 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->minFragmentDensityTexelSize = (VkExtent2D) { MIN_FDM_TEXEL_SIZE, MIN_FDM_TEXEL_SIZE };
    props->maxFragmentDensityTexelSize = (VkExtent2D) { MAX_FDM_TEXEL_SIZE, MAX_FDM_TEXEL_SIZE };
    props->fragmentDensityInvocations = false;
+   props->subsampledLoads = false;
+   props->subsampledCoarseReconstructionEarlyAccess = false;
+   props->maxSubsampledArrayLayers = TU_SUBSAMPLED_MAX_LAYERS;
+   props->maxDescriptorSetSubsampledSamplers = max_descriptor_set_size / 3;
 
    /* VK_KHR_maintenance5 */
    props->earlyFragmentMultisampleCoverageAfterSampleCounting = true;
@@ -3696,6 +3707,76 @@ tu_memory_emit_report(struct tu_device *device,
                                 (uintptr_t)(mem), /* heap_index */ 0);
 }
 
+#if DETECT_OS_ANDROID
+static VkResult
+tu_import_qcom_surface(struct tu_device *device, int fd, const struct tu_image *image,
+                       struct fdl_layout *layout)
+{
+   if (!is_kgsl(device->physical_device->instance) || !image)
+      return VK_SUCCESS;
+
+   const off_t size = lseek(fd, 0, SEEK_END);
+   if (size < off_t(tu_qcom_surface::metadata_size))
+      return size >= 0 ? VK_SUCCESS : VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   const off_t start = size - tu_qcom_surface::metadata_size;
+   const off_t offset = start - start % os_page_size;
+   const size_t length = size - offset;
+   void *mapped = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, offset);
+   if (mapped == MAP_FAILED)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct dma_buf_sync sync = {DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+   int sync_result;
+   do {
+      sync_result = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+   } while (sync_result && errno == EINTR);
+   if (sync_result) {
+      munmap(mapped, length);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+   uint8_t metadata[tu_qcom_surface::metadata_size];
+   memcpy(metadata, (const uint8_t *)mapped + start - offset, sizeof(metadata));
+   sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+   do {
+      sync_result = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+   } while (sync_result && errno == EINTR);
+   munmap(mapped, length);
+   if (sync_result)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   tu_qcom_surface::layout imported;
+   const auto decoded = tu_qcom_surface::decode(metadata, sizeof(metadata), size, imported);
+   if (decoded == tu_qcom_surface::result::absent)
+      return VK_SUCCESS;
+   if (decoded != tu_qcom_surface::result::valid)
+      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "Unsupported QCOM surface metadata");
+
+   if (image->vk.format != (imported.format == 28 ? VK_FORMAT_R8G8B8A8_UNORM :
+                                                  VK_FORMAT_R8G8B8A8_SRGB) ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != imported.layers ||
+       image->vk.extent.depth != 1 || image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       image->vk.create_flags || !layout->ubwc || layout->tile_mode != TILE6_3 ||
+       imported.width != layout->width0 || imported.height != layout->height0 ||
+       imported.pitch != fdl_pitch(layout, 0) ||
+       imported.flags_pitch != fdl_ubwc_pitch(layout, 0) ||
+       imported.data_size != layout->slices[0].size0 ||
+       imported.data_size != layout->layer_size ||
+       imported.flags_size != layout->ubwc_layer_size ||
+       imported.flags_size != layout->ubwc_slices[0].size0 ||
+       imported.data_offset + imported.data_size * imported.layers > image->total_size ||
+       imported.flags_offset + imported.flags_size * imported.layers > image->total_size)
+      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "QCOM surface layout does not match the dedicated image");
+
+   layout->slices[0].offset = imported.data_offset;
+   layout->ubwc_slices[0].offset = imported.flags_offset;
+   return VK_SUCCESS;
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_AllocateMemory(VkDevice _device,
                   const VkMemoryAllocateInfo *pAllocateInfo,
@@ -3741,6 +3822,9 @@ tu_AllocateMemory(VkDevice _device,
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
 
+   struct tu_image *imported_image = NULL;
+   struct fdl_layout imported_layout;
+
    const VkBufferDeviceAddressAlignmentAllocateInfoVALVE *align_info =
       vk_find_struct_const(pAllocateInfo->pNext,
                            BUFFER_DEVICE_ADDRESS_ALIGNMENT_ALLOCATE_INFO_VALVE);
@@ -3751,6 +3835,22 @@ tu_AllocateMemory(VkDevice _device,
                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
              fd_info->handleType ==
                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+
+#if DETECT_OS_ANDROID
+      const VkMemoryDedicatedAllocateInfo *dedicated =
+         vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+      if (fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+          dedicated && dedicated->image) {
+         imported_image = tu_image_from_handle(dedicated->image);
+         imported_layout = imported_image->layout[0];
+         result = tu_import_qcom_surface(device, fd_info->fd, imported_image,
+                                         &imported_layout);
+         if (result != VK_SUCCESS) {
+            vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
+            return result;
+         }
+      }
+#endif
 
       /*
        * TODO Importing the same fd twice gives us the same handle without
@@ -3819,6 +3919,9 @@ tu_AllocateMemory(VkDevice _device,
       tu_memory_emit_report(device, /* mem */ NULL, pAllocateInfo, result);
       return result;
    }
+
+   if (imported_image)
+      imported_image->layout[0] = imported_layout;
 
    const VkMemoryDedicatedAllocateInfo *dedicate_info =
       vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
