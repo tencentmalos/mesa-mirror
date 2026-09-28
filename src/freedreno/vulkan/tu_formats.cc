@@ -217,7 +217,8 @@ tu_physical_device_get_format_properties(
        * to use, which means two channels and not something weird like
        * luminance-alpha.
        */
-      if (vk_format_is_float(vk_format) && desc->nr_channels == 2 &&
+      if ((vk_format_is_float(vk_format) || vk_format == VK_FORMAT_R8G8_UNORM) &&
+          desc->nr_channels == 2 &&
           desc->swizzle[0] == PIPE_SWIZZLE_X &&
           desc->swizzle[1] == PIPE_SWIZZLE_Y) {
          optimal |= VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT;
