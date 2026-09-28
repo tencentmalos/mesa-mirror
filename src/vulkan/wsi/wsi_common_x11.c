@@ -42,6 +42,11 @@
 #include <errno.h>
 #include <string.h>
 #include <fcntl.h>
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#include <sys/socket.h>
+#include <poll.h>
+#endif
 #include "drm-uapi/drm_fourcc.h"
 #include "util/libdrm.h"
 #include "util/cnd_monotonic.h"
@@ -1222,6 +1227,9 @@ struct x11_image_pending_completion {
 
 struct x11_image {
    struct wsi_image                          base;
+#ifdef __ANDROID__
+   struct AHardwareBuffer *ahb;
+#endif
    xcb_pixmap_t                              pixmap;
    xcb_xfixes_region_t                       update_region; /* long lived XID */
    xcb_xfixes_region_t                       update_area;   /* the above or None */
@@ -1759,7 +1767,7 @@ x11_handle_dri3_present_event(struct x11_swapchain *chain,
 
    return VK_SUCCESS;
 }
-#ifdef HAVE_X11_DRM
+#if defined(HAVE_X11_DRM) || defined(__ANDROID__)
 /**
  * Send image to X server via Present extension.
  */
@@ -1795,7 +1803,10 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
        !wsi_device->x11.ignore_suboptimal)
       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
 
-   xshmfence_reset(image->shm_fence);
+#ifdef HAVE_X11_DRM
+   if (image->shm_fence)
+      xshmfence_reset(image->shm_fence);
+#endif
 
    if (!chain->base.image_info.explicit_sync) {
       ++chain->sent_image_count;
@@ -2004,6 +2015,10 @@ x11_needs_wait_for_fences(const struct wsi_device *wsi_device,
                           struct wsi_x11_connection *wsi_conn,
                           VkPresentModeKHR present_mode)
 {
+#ifdef __ANDROID__
+   if (getenv("XRGAME_X11_AHB"))
+      return true;
+#endif
    if (wsi_conn->is_xwayland) {
       return false;
    }
@@ -2097,7 +2112,7 @@ x11_present_to_x11(struct x11_swapchain *chain, uint32_t image_index,
    if (chain->base.wsi->sw && !chain->has_mit_shm)
       result = x11_present_to_x11_sw(chain, image_index);
    else
-#ifdef HAVE_X11_DRM
+#if defined(HAVE_X11_DRM) || defined(__ANDROID__)
       result = x11_present_to_x11_dri3(chain, image_index, target_msc, present_mode);
 #else
       UNREACHABLE("X11 missing DRI3 support!");
@@ -2610,6 +2625,10 @@ x11_manage_present_queue(void *state)
    return 0;
 }
 
+#ifdef __ANDROID__
+#include "wsi_common_x11_android.inc"
+#endif
+
 static uint8_t *
 alloc_shm(struct wsi_image *imagew, unsigned size)
 {
@@ -2643,9 +2662,20 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
 
    result = wsi_create_image(&chain->base, &chain->base.image_info,
                              &image->base);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+#ifdef __ANDROID__
+      if (image->ahb) {
+         AHardwareBuffer_release(image->ahb);
+         image->ahb = NULL;
+      }
+#endif
       return result;
+   }
 
+#ifdef __ANDROID__
+   if (chain->base.image_info.image_type == WSI_IMAGE_TYPE_ANDROID)
+      return x11_android_image_attach(chain, image);
+#endif
    image->update_region = None;
    if (chain->base.wsi->sw && !chain->has_mit_shm)
       return VK_SUCCESS;
@@ -2824,6 +2854,12 @@ x11_image_finish(struct x11_swapchain *chain,
    }
 
    wsi_destroy_image(&chain->base, &image->base);
+#ifdef __ANDROID__
+   if (image->ahb) {
+      AHardwareBuffer_release(image->ahb);
+      image->ahb = NULL;
+   }
+#endif
 #ifdef HAVE_SYS_SHM_H
    if (image->shmaddr)
       shmdt(image->shmaddr);
@@ -3002,7 +3038,7 @@ x11_swapchain_destroy(struct wsi_swapchain *wsi_chain,
 
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       x11_image_finish(chain, pAllocator, &chain->images[i]);
-#ifdef HAVE_X11_DRM
+#if defined(HAVE_X11_DRM) || defined(__ANDROID__)
    xcb_void_cookie_t cookie;
    xcb_unregister_for_special_event(chain->conn, chain->special_event);
    cookie = xcb_present_select_input_checked(chain->conn, chain->event_id,
@@ -3220,6 +3256,9 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
 #endif
    struct wsi_base_image_params *image_params = NULL;
    struct wsi_cpu_image_params cpu_image_params;
+#ifdef __ANDROID__
+   struct wsi_base_image_params android_image_params = { WSI_IMAGE_TYPE_ANDROID };
+#endif
    uint64_t *modifiers[2] = {NULL, NULL};
    if (wsi_device->sw) {
       cpu_image_params = (struct wsi_cpu_image_params) {
@@ -3227,6 +3266,10 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
          .alloc_shm = wsi_conn->has_mit_shm ? &alloc_shm : NULL,
       };
       image_params = &cpu_image_params.base;
+#ifdef __ANDROID__
+   } else if (getenv("XRGAME_X11_AHB")) {
+      image_params = &android_image_params;
+#endif
    } else {
 #ifdef HAVE_X11_DRM
       drm_image_params = (struct wsi_drm_image_params) {
@@ -3322,7 +3365,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     * 'PresentOptionSuboptimal' complete mode.
     */
    chain->copy_is_suboptimal = false;
-#ifdef HAVE_X11_DRM
+#if defined(HAVE_X11_DRM) || defined(__ANDROID__)
    /* For our swapchain we need to listen to following Present extension events:
     * - Configure: Window dimensions changed. Images in the swapchain might need
     *              to be reallocated.
@@ -3429,7 +3472,7 @@ fail_init_images:
       x11_image_finish(chain, pAllocator, &chain->images[j]);
 
 fail_register:
-#ifdef HAVE_X11_DRM
+#if defined(HAVE_X11_DRM) || defined(__ANDROID__)
    xcb_unregister_for_special_event(chain->conn, chain->special_event);
 #endif
    wsi_swapchain_finish(&chain->base);

@@ -402,6 +402,10 @@ get_blit_type(const struct wsi_device *wsi,
               VkDevice device)
 {
    switch (params->image_type) {
+#if defined(__ANDROID__) && defined(VK_USE_PLATFORM_XCB_KHR)
+   case WSI_IMAGE_TYPE_ANDROID:
+      return WSI_SWAPCHAIN_NO_BLIT;
+#endif
    case WSI_IMAGE_TYPE_CPU: {
       const struct wsi_cpu_image_params *cpu_params =
          container_of(params, const struct wsi_cpu_image_params, base);
@@ -453,6 +457,10 @@ configure_image(const struct wsi_swapchain *chain,
    info->color_space = pCreateInfo->imageColorSpace;
 
    switch (params->image_type) {
+#if defined(__ANDROID__) && defined(VK_USE_PLATFORM_XCB_KHR)
+   case WSI_IMAGE_TYPE_ANDROID:
+      return wsi_x11_configure_android_image(chain, pCreateInfo, info);
+#endif
    case WSI_IMAGE_TYPE_CPU: {
       const struct wsi_cpu_image_params *cpu_params =
          container_of(params, const struct wsi_cpu_image_params, base);

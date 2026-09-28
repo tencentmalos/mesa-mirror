@@ -49,6 +49,7 @@ enum wsi_image_type {
    WSI_IMAGE_TYPE_DRM,
    WSI_IMAGE_TYPE_DXGI,
    WSI_IMAGE_TYPE_METAL,
+   WSI_IMAGE_TYPE_ANDROID,
 };
 
 struct wsi_base_image_params {
@@ -436,6 +437,13 @@ wsi_configure_image(const struct wsi_swapchain *chain,
                     const VkSwapchainCreateInfoKHR *pCreateInfo,
                     VkExternalMemoryHandleTypeFlags handle_types,
                     struct wsi_image_info *info);
+#if defined(__ANDROID__) && defined(VK_USE_PLATFORM_XCB_KHR)
+VkResult
+wsi_x11_configure_android_image(const struct wsi_swapchain *chain,
+                                const VkSwapchainCreateInfoKHR *info,
+                                struct wsi_image_info *image_info);
+#endif
+
 void
 wsi_destroy_image_info(const struct wsi_swapchain *chain,
                        struct wsi_image_info *info);
