@@ -196,6 +196,10 @@ vk_cmd_queue_finish(struct vk_cmd_queue *queue)
    vk_free_queue(queue);
 }
 
+void vk_cmd_queue_execute_command(const struct vk_cmd_queue_entry *cmd,
+                                  VkCommandBuffer commandBuffer,
+                                  const struct vk_device_dispatch_table *disp);
+
 void vk_cmd_queue_execute(struct vk_cmd_queue *queue,
                           VkCommandBuffer commandBuffer,
                           const struct vk_device_dispatch_table *disp);
@@ -437,30 +441,37 @@ vk_free_queue(struct vk_cmd_queue *queue)
 }
 
 void
-vk_cmd_queue_execute(struct vk_cmd_queue *queue,
-                     VkCommandBuffer commandBuffer,
-                     const struct vk_device_dispatch_table *disp)
+vk_cmd_queue_execute_command(const struct vk_cmd_queue_entry *cmd,
+                             VkCommandBuffer commandBuffer,
+                             const struct vk_device_dispatch_table *disp)
 {
-   list_for_each_entry(struct vk_cmd_queue_entry, cmd, &queue->cmds, cmd_link) {
-      switch (cmd->type) {
+   switch (cmd->type) {
 % for c in commands:
 % if c.guard is not None:
 #ifdef ${c.guard}
 % endif
-      case ${to_enum_name(c.name)}:
-          disp->${c.name}(commandBuffer
+   case ${to_enum_name(c.name)}:
+       disp->${c.name}(commandBuffer
 % for p in c.params[1:]:
-             , cmd->u.${to_struct_field_name(c.name)}.${to_field_name(p.name)}\\
+          , cmd->u.${to_struct_field_name(c.name)}.${to_field_name(p.name)}\\
 % endfor
-          );
-          break;
+       );
+       break;
 % if c.guard is not None:
 #endif // ${c.guard}
 % endif
 % endfor
-      default: UNREACHABLE("Unsupported command");
-      }
+   default: UNREACHABLE("Unsupported command");
    }
+}
+
+void
+vk_cmd_queue_execute(struct vk_cmd_queue *queue,
+                     VkCommandBuffer commandBuffer,
+                     const struct vk_device_dispatch_table *disp)
+{
+   list_for_each_entry(struct vk_cmd_queue_entry, cmd, &queue->cmds, cmd_link)
+      vk_cmd_queue_execute_command(cmd, commandBuffer, disp);
 }
 
 % for c in commands:

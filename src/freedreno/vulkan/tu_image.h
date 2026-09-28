@@ -162,6 +162,7 @@ struct tu_frag_area {
 
 void
 tu_fragment_density_map_sample(const struct tu_image_view *fdm,
+                               const uint8_t *snapshot,
                                int32_t x, int32_t y,
                                uint32_t width, uint32_t height,
                                uint32_t layer, struct tu_frag_area *area);
