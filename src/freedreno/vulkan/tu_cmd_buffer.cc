@@ -1622,6 +1622,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
    }
 
    bool bin_scale_en =
+      CHIP < A8XX &&
       cmd->device->physical_device->info->props.has_hw_bin_scaling &&
       layers <= MAX_HW_SCALED_VIEWS && !cmd->state.rp.shared_viewport &&
       bin_is_scaled;
@@ -1848,7 +1849,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
           * on the actual offset, and signficantly changing the performance
           * could result in jank between frames as the offset changes.
           */
-         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_scale_en;
+         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_is_scaled;
          bool subsampled_use_fast_store = non_subsampled_use_fast_store ||
             (tile->subsampled_views == tile->visible_views &&
              !tile->subsampled_border);
@@ -3467,6 +3468,9 @@ tu7_emit_concurrent_binning_gmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       cmd->state.rp.has_prim_generated_query_in_rp ||
       cmd->state.rp.has_vtx_stats_query_in_rp ||
       cmd->state.prim_counters_running > 0;
+
+   disable_cb |= tu7_cb_disable_reason(cmd->fdm_bin_patchpoints.size != 0,
+                                       cmd, "FDM patchpoints");
 
    tu7_cb_disable_reason(disable_cb, cmd,
       "xfb/prim-gen/prim-counters/vtx-stats query is running");
