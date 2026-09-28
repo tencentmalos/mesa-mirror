@@ -1590,6 +1590,9 @@ tu_fragment_density_map_sample(const struct tu_image_view *fdm,
    unsigned cpp = fdm->image->layout[0].cpp;
    unsigned pitch = fdm->view.pitch;
 
+   if (fdm->vk.layer_count == 1)
+      layer = 0;
+
    void *pixel = (char *)fdm->image->map + fdm->view.offset + fdm->view.layer_size * layer + cpp * i + pitch * j;
    float density_src[4], density[4];
    util_format_unpack_rgba(fdm->view.format, density_src, pixel, 1);
@@ -1755,4 +1758,3 @@ tu_bind_sparse_image(struct tu_device *device, void *submit,
                          prev_bo_offset, bind_range);
    }
 }
-
