@@ -56,7 +56,34 @@ kgsl_submitqueue_new(struct tu_device *dev, struct tu_queue *queue)
               KGSL_CONTEXT_PREAMBLE,
    };
 
+   const bool preempt_rb = TU_DEBUG_START(KGSL_PREEMPT_RB);
+   const bool preempt_fg = TU_DEBUG_START(KGSL_PREEMPT_FG);
+   if (preempt_rb && preempt_fg) {
+      mesa_loge("KGSL preemption: kgsl_preempt_rb and kgsl_preempt_fg "
+                "cannot be enabled together");
+      errno = EINVAL;
+      return -1;
+   }
+   const uint32_t preempt_style =
+      preempt_rb ? KGSL_CONTEXT_PREEMPT_STYLE_RINGBUFFER :
+      preempt_fg ? KGSL_CONTEXT_PREEMPT_STYLE_FINEGRAIN :
+                   KGSL_CONTEXT_PREEMPT_STYLE_DEFAULT;
+   req.flags |= preempt_style << KGSL_CONTEXT_PREEMPT_STYLE_SHIFT;
+   const uint32_t requested_flags = req.flags;
+
    int ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
+   if (preempt_rb || preempt_fg) {
+      const int saved_errno = errno;
+      mesa_logi("KGSL preemption: requested_flags=0x%x returned_flags=0x%x "
+                "requested_style=%u returned_style=%u context=%u "
+                "result=%d errno=%d",
+                requested_flags, req.flags, preempt_style,
+                (req.flags & KGSL_CONTEXT_PREEMPT_STYLE_MASK) >>
+                   KGSL_CONTEXT_PREEMPT_STYLE_SHIFT,
+                ret ? 0 : req.drawctxt_id, ret,
+                ret ? saved_errno : 0);
+      errno = saved_errno;
+   }
    if (ret)
       return ret;
 

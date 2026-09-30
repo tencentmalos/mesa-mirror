@@ -58,6 +58,9 @@ static const struct debug_control tu_debug_options[] = {
    { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
    { "gmem_warmup", TU_DEBUG_GMEM_WARMUP },
+   { "sds_page_align", TU_DEBUG_SDS_PAGE_ALIGN },
+   { "kgsl_preempt_rb", TU_DEBUG_KGSL_PREEMPT_RB },
+   { "kgsl_preempt_fg", TU_DEBUG_KGSL_PREEMPT_FG },
    { NULL, 0 }
 };
 
@@ -291,12 +294,20 @@ tu_tiling_config_update_tile_layout(struct tu_framebuffer *fb,
    /* There aren't that many different tile widths possible, so just walk all
     * of them finding which produces the lowest number of bins.
     */
-   const uint32_t max_tile_width =
+   uint32_t max_tile_width =
       MIN3(dev->physical_device->info->tile_max_w,
            util_align_npot(fb->width, tile_align_w), fb->max_tile_w_constraint);
-   const uint32_t max_tile_height =
+   uint32_t max_tile_height =
       MIN3(dev->physical_device->info->tile_max_h,
            align(fb->height, tile_align_h), fb->max_tile_h_constraint);
+   if (pass->has_fdm) {
+      const uint32_t fdm_limit = MAX2(MIN2(fb->width, fb->height) / 8,
+                                     MIN_FDM_TEXEL_SIZE);
+      max_tile_width = MIN2(max_tile_width,
+         MAX2(tile_align_w, ROUND_DOWN_TO_NPOT(fdm_limit, tile_align_w)));
+      max_tile_height = MIN2(max_tile_height,
+         MAX2(tile_align_h, ROUND_DOWN_TO(fdm_limit, tile_align_h)));
+   }
    for (tile_size.width = tile_align_w; tile_size.width <= max_tile_width;
         tile_size.width += tile_align_w) {
       tile_size.height = pass->gmem_pixels[gmem_layout] / (tile_size.width * layers);

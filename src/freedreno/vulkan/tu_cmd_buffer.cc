@@ -1848,7 +1848,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
           * on the actual offset, and signficantly changing the performance
           * could result in jank between frames as the offset changes.
           */
-         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_scale_en;
+         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_is_scaled;
          bool subsampled_use_fast_store = non_subsampled_use_fast_store ||
             (tile->subsampled_views == tile->visible_views &&
              !tile->subsampled_border);
