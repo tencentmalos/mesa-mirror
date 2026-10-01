@@ -56,6 +56,9 @@ kgsl_submitqueue_new(struct tu_device *dev, struct tu_queue *queue)
               KGSL_CONTEXT_PREAMBLE,
    };
 
+   if (TU_DEBUG_START(CMD_NO_PREEMPT))
+      mesa_logi("Turnip: cmd_no_preempt wraps primary command buffers in "
+                "CP_SCOPE_CNTL(disable_preemption)");
    const bool preempt_rb = TU_DEBUG_START(KGSL_PREEMPT_RB);
    const bool preempt_fg = TU_DEBUG_START(KGSL_PREEMPT_FG);
    if (preempt_rb && preempt_fg) {

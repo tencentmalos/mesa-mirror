@@ -61,6 +61,7 @@ static const struct debug_control tu_debug_options[] = {
    { "sds_page_align", TU_DEBUG_SDS_PAGE_ALIGN },
    { "kgsl_preempt_rb", TU_DEBUG_KGSL_PREEMPT_RB },
    { "kgsl_preempt_fg", TU_DEBUG_KGSL_PREEMPT_FG },
+   { "cmd_no_preempt", TU_DEBUG_CMD_NO_PREEMPT },
    { NULL, 0 }
 };
 

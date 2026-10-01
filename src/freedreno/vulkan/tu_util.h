@@ -79,6 +79,7 @@ enum tu_debug_flags : uint64_t
    TU_DEBUG_SDS_PAGE_ALIGN           = BITFIELD64_BIT(39),
    TU_DEBUG_KGSL_PREEMPT_RB          = BITFIELD64_BIT(40),
    TU_DEBUG_KGSL_PREEMPT_FG          = BITFIELD64_BIT(41),
+   TU_DEBUG_CMD_NO_PREEMPT           = BITFIELD64_BIT(42),
 };
 
 struct tu_env {
