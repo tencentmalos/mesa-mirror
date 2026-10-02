@@ -259,6 +259,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
       .KHR_format_feature_flags2 = true,
+      .KHR_fragment_shader_barycentric = true,
       .KHR_fragment_shading_rate = device->info->props.has_attachment_shading_rate,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = tu_is_vk_1_1(device),
@@ -622,6 +623,8 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_KHR_dynamic_rendering_local_read */
    features->dynamicRenderingLocalRead = true;
+
+   features->fragmentShaderBarycentric = true;
 
    /* VK_KHR_fragment_shading_rate */
    features->pipelineFragmentShadingRate = pdevice->info->props.has_attachment_shading_rate;
@@ -1392,6 +1395,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->fragmentShadingRateWithFragmentShaderInterlock = false;
    props->fragmentShadingRateWithCustomSampleLocations = true;
    props->fragmentShadingRateStrictMultiplyCombiner = true;
+
+   props->triStripVertexOrderIndependentOfProvokingVertex = false;
 
    /* VK_KHR_push_descriptor */
    props->maxPushDescriptors = MAX_PUSH_DESCRIPTORS;

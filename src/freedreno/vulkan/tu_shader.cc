@@ -3401,6 +3401,45 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
    return &shader->base;
 }
 
+static bool
+lower_barycentric_coord(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_intrinsic_op op;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_barycentric_coord_pixel:
+      op = nir_intrinsic_load_barycentric_pixel;
+      break;
+   case nir_intrinsic_load_barycentric_coord_centroid:
+      op = nir_intrinsic_load_barycentric_centroid;
+      break;
+   case nir_intrinsic_load_barycentric_coord_sample:
+      op = nir_intrinsic_load_barycentric_sample;
+      break;
+   case nir_intrinsic_load_barycentric_coord_at_sample:
+      op = nir_intrinsic_load_barycentric_at_sample;
+      break;
+   case nir_intrinsic_load_barycentric_coord_at_offset:
+      op = nir_intrinsic_load_barycentric_at_offset;
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_intrinsic_instr *bary = nir_intrinsic_instr_create(b->shader, op);
+   nir_def_init(&bary->instr, &bary->def, 2, 32);
+   nir_intrinsic_set_interp_mode(bary, nir_intrinsic_interp_mode(intr));
+   if (nir_intrinsic_infos[op].num_srcs)
+      bary->src[0] = nir_src_for_ssa(intr->src[0].ssa);
+   nir_builder_instr_insert(b, &bary->instr);
+
+   nir_def *i = nir_channel(b, &bary->def, 0);
+   nir_def *j = nir_channel(b, &bary->def, 1);
+   nir_def *k = nir_fsub(b, nir_fsub_imm(b, 1.0, i), j);
+   nir_def_replace(&intr->def, nir_vec3(b, k, i, j));
+   return true;
+}
+
 void
 tu_lower_nir(struct tu_device *dev,
              nir_shader *nir,
@@ -3436,6 +3475,9 @@ tu_lower_nir(struct tu_device *dev,
          .view_index = true,
       };
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysval_options);
+
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_barycentric_coord,
+               nir_metadata_control_flow, NULL);
    }
 
    /* This has to happen before lower_input_attachments, because we have to
@@ -3788,6 +3830,192 @@ tu6_get_tessmode(const struct nir_shader *shader)
    }
 }
 
+struct tu_per_vertex_inputs {
+   uint8_t components[64];
+   bool wide[64];
+   bool read_otherwise[64];
+   unsigned lo[64], hi[64];
+};
+
+static bool
+per_vertex_slot(nir_intrinsic_instr *intr, unsigned *slot)
+{
+   nir_src *offset = nir_get_io_offset_src(intr);
+   if (!nir_src_is_const(*offset))
+      return false;
+   *slot = nir_intrinsic_io_semantics(intr).location + nir_src_as_uint(*offset);
+   return *slot < 64;
+}
+
+static bool
+gather_per_vertex_inputs(nir_shader *fs, struct tu_per_vertex_inputs *state)
+{
+   bool supported = true;
+   nir_foreach_function_impl (impl, fs) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_input_vertex &&
+                intr->intrinsic != nir_intrinsic_load_interpolated_input &&
+                intr->intrinsic != nir_intrinsic_load_input)
+               continue;
+            unsigned slot;
+            if (!per_vertex_slot(intr, &slot)) {
+               supported &= intr->intrinsic != nir_intrinsic_load_input_vertex;
+               continue;
+            }
+            if (intr->intrinsic != nir_intrinsic_load_input_vertex) {
+               state->read_otherwise[slot] = true;
+               continue;
+            }
+            if (slot < VARYING_SLOT_VAR0 || intr->def.bit_size > 32) {
+               supported = false;
+               continue;
+            }
+            state->components[slot] |=
+               BITFIELD_RANGE(nir_intrinsic_component(intr),
+                              intr->def.num_components);
+            state->wide[slot] |= intr->def.bit_size == 32;
+         }
+      }
+   }
+   return supported;
+}
+
+static bool
+write_per_vertex_outputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct tu_per_vertex_inputs *state =
+      (const struct tu_per_vertex_inputs *) data;
+   unsigned slot;
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       !per_vertex_slot(intr, &slot) || !state->components[slot])
+      return false;
+
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *value = intr->src[0].ssa;
+   if (value->bit_size == 16)
+      value = nir_u2u32(b, value);
+   const nir_io_semantics lo_sem = { .location = state->lo[slot], .num_slots = 1 };
+   nir_store_output(b, nir_u2f32(b, nir_iand_imm(b, value, 0xffff)), nir_imm_int(b, 0),
+                    .base = 0, .write_mask = nir_intrinsic_write_mask(intr),
+                    .component = nir_intrinsic_component(intr),
+                    .src_type = nir_type_float32, .io_semantics = lo_sem);
+   if (state->wide[slot]) {
+      const nir_io_semantics hi_sem = { .location = state->hi[slot], .num_slots = 1 };
+      nir_store_output(b, nir_u2f32(b, nir_ushr_imm(b, value, 16)), nir_imm_int(b, 0),
+                       .base = 0, .write_mask = nir_intrinsic_write_mask(intr),
+                       .component = nir_intrinsic_component(intr),
+                       .src_type = nir_type_float32, .io_semantics = hi_sem);
+   }
+   if (!state->read_otherwise[slot] && !b->shader->xfb_info)
+      nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static nir_def *
+interpolate_corner(nir_builder *b, nir_def *ij, unsigned slot,
+                   nir_intrinsic_instr *load)
+{
+   const nir_io_semantics sem = { .location = slot, .num_slots = 1 };
+   nir_def *value = nir_load_interpolated_input(
+      b, load->def.num_components, 32, ij, nir_imm_int(b, 0), .base = 0,
+      .component = nir_intrinsic_component(load), .dest_type = nir_type_float32,
+      .io_semantics = sem);
+   return nir_f2u32(b, nir_fround_even(b, value));
+}
+
+static bool
+read_per_vertex_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct tu_per_vertex_inputs *state =
+      (const struct tu_per_vertex_inputs *) data;
+   unsigned slot;
+   if (intr->intrinsic != nir_intrinsic_load_input_vertex ||
+       !per_vertex_slot(intr, &slot))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *vertex = intr->src[0].ssa;
+   nir_def *ij;
+   if (nir_src_is_const(intr->src[0])) {
+      const uint32_t v = nir_src_as_uint(intr->src[0]);
+      ij = nir_imm_vec2(b, v == 1 ? 1.0f : 0.0f, v == 2 ? 1.0f : 0.0f);
+   } else {
+      ij = nir_vec2(b, nir_b2f32(b, nir_ieq_imm(b, vertex, 1)),
+                    nir_b2f32(b, nir_ieq_imm(b, vertex, 2)));
+   }
+   nir_def *value = interpolate_corner(b, ij, state->lo[slot], intr);
+   if (intr->def.bit_size == 32) {
+      value = nir_ior(b, value,
+                      nir_ishl_imm(b, interpolate_corner(b, ij, state->hi[slot], intr), 16));
+   } else {
+      value = nir_u2u16(b, value);
+   }
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+static VkResult
+tu_lower_per_vertex_inputs(nir_shader **nir)
+{
+   nir_shader *fs = nir[MESA_SHADER_FRAGMENT];
+   if (!fs)
+      return VK_SUCCESS;
+
+   struct tu_per_vertex_inputs state = {};
+   const bool supported = gather_per_vertex_inputs(fs, &state);
+   uint64_t slots = 0;
+   for (unsigned slot = 0; slot < 64; slot++) {
+      if (state.components[slot])
+         slots |= BITFIELD64_BIT(slot);
+   }
+   if (!slots && supported)
+      return VK_SUCCESS;
+
+   nir_shader *producer = nir[MESA_SHADER_GEOMETRY] ? nir[MESA_SHADER_GEOMETRY]
+                        : nir[MESA_SHADER_TESS_EVAL] ? nir[MESA_SHADER_TESS_EVAL]
+                        : nir[MESA_SHADER_VERTEX];
+   if (!supported || !producer) {
+      mesa_loge("per-vertex fragment inputs need a linked last pre-rasterization "
+                "stage and constant generic slots");
+      return VK_ERROR_UNKNOWN;
+   }
+
+   uint64_t used = producer->info.outputs_written | fs->info.inputs_read | slots;
+   unsigned next = VARYING_SLOT_VAR0;
+   auto allocate = [&](unsigned *out) {
+      while (next <= VARYING_SLOT_VAR31 && (used & BITFIELD64_BIT(next)))
+         next++;
+      if (next > VARYING_SLOT_VAR31)
+         return false;
+      used |= BITFIELD64_BIT(next);
+      *out = next;
+      return true;
+   };
+   u_foreach_bit64 (slot, slots) {
+      if (!allocate(&state.lo[slot]) ||
+          (state.wide[slot] && !allocate(&state.hi[slot]))) {
+         mesa_loge("not enough varying slots for per-vertex fragment inputs");
+         return VK_ERROR_UNKNOWN;
+      }
+   }
+
+   NIR_PASS(_, producer, nir_shader_intrinsics_pass, write_per_vertex_outputs,
+            nir_metadata_control_flow, &state);
+   NIR_PASS(_, fs, nir_shader_intrinsics_pass, read_per_vertex_inputs,
+            nir_metadata_control_flow, &state);
+   NIR_PASS(_, producer, nir_opt_dce);
+   NIR_PASS(_, fs, nir_opt_dce);
+   nir_shader_gather_info(producer, nir_shader_get_entrypoint(producer));
+   nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
+   NIR_PASS(_, producer, nir_recompute_io_bases, nir_var_shader_out);
+   NIR_PASS(_, fs, nir_recompute_io_bases, nir_var_shader_in);
+   return VK_SUCCESS;
+}
+
 VkResult
 tu_compile_shaders(struct tu_device *device,
                    VkPipelineCreateFlags2KHR pipeline_flags,
@@ -3864,6 +4092,10 @@ tu_compile_shaders(struct tu_device *device,
          nir_out[stage] = nir_shader_clone(NULL, nir[stage]);
       }
    }
+
+   result = tu_lower_per_vertex_inputs(nir);
+   if (result != VK_SUCCESS)
+      goto fail;
 
    /* With pipelines, tessellation modes can be set on either shader, for
     * compatibility with HLSL and GLSL, and the driver is supposed to merge
