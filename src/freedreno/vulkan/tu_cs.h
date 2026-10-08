@@ -11,6 +11,7 @@
 #include "freedreno_pm4.h"
 
 #include "tu_knl.h"
+#include "tu_util.h"
 
 /* For breadcrumbs we may open a network socket based on the envvar,
  * it's not something that should be enabled by default.
@@ -482,6 +483,8 @@ tu_cs_emit_pkt4(struct tu_cs *cs, uint16_t regindx, uint16_t cnt)
    tu_cs_emit(cs, pm4_pkt4_hdr(regindx, cnt));
 }
 
+void tu_cs_align_draw_state(struct tu_cs *cs, uint16_t cnt);
+
 /**
  * Emit a type-7 command packet header into a command stream.
  */
@@ -492,6 +495,10 @@ tu_cs_emit_pkt7(struct tu_cs *cs, uint8_t opcode, uint16_t cnt)
 #if TU_BREADCRUMBS_ENABLED
    tu_cs_emit_sync_breadcrumb(cs, opcode, cnt + 1);
 #endif
+
+   if (opcode == CP_SET_DRAW_STATE && cs->mode == TU_CS_MODE_GROW &&
+       TU_DEBUG_START(SDS_PAGE_ALIGN))
+      tu_cs_align_draw_state(cs, cnt);
 
    tu_cs_reserve(cs, cnt + 1);
    tu_cs_emit(cs, pm4_pkt7_hdr(opcode, cnt));

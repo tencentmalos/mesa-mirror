@@ -306,6 +306,7 @@ struct tu_virtio_device;
 struct tu_device
 {
    struct vk_device vk;
+   struct vk_device_dispatch_table deferred_dispatch;
    struct tu_instance *instance;
 
    struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];

@@ -681,6 +681,12 @@ struct tu_cmd_buffer
 
    struct tu_device *device;
 
+   bool deferred_recording;
+   bool deferred_replaying;
+   void *fdm_snapshots_ctx;
+   struct tu_fdm_snapshot *fdm_snapshots, *fdm_snapshots_tail;
+   const uint8_t *fdm_host_snapshot;
+
    struct u_trace_iterator trace_renderpass_start;
    struct u_trace trace, rp_trace;
 

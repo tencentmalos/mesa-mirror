@@ -529,6 +529,37 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
    return VK_SUCCESS;
 }
 
+void
+tu_cs_align_draw_state(struct tu_cs *cs, uint16_t cnt)
+{
+   if (!cnt || cnt >= 1024 || cs->status != VK_SUCCESS)
+      return;
+
+   tu_cs_reserve(cs, cnt + 1);
+   if (cs->status != VK_SUCCESS)
+      return;
+
+   uint32_t remaining = 1024 - ((tu_cs_get_cur_iova(cs) & 4095) / 4);
+   if (remaining >= cnt + 1)
+      return;
+
+   tu_cs_reserve(cs, remaining + cnt + 1);
+   if (cs->status != VK_SUCCESS)
+      return;
+   remaining = 1024 - ((tu_cs_get_cur_iova(cs) & 4095) / 4);
+   if (remaining >= cnt + 1)
+      return;
+
+   static std::atomic<uint32_t> logged{0};
+   if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+      mesa_logi("SDS page align: iova=0x%" PRIx64 " payload=%u pad=%u",
+                tu_cs_get_cur_iova(cs), cnt, remaining);
+
+   tu_cs_emit(cs, pm4_pkt7_hdr(CP_NOP, remaining - 1));
+   for (uint32_t i = 1; i < remaining; i++)
+      tu_cs_emit(cs, 0);
+}
+
 /**
  * Reset a command stream to its initial state.  This discards all comand
  * packets in \a cs, but does not necessarily release all resources.

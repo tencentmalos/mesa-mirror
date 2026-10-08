@@ -30,7 +30,7 @@ setup_args=()
 if [[ -f "$build_root/native/meson-private/coredata.dat" ]]; then
   setup_args+=(--reconfigure --clearcache)
 fi
-meson setup "${setup_args[@]}" "$build_root/native" "$source_root" \
+meson setup ${setup_args[@]+"${setup_args[@]}"} "$build_root/native" "$source_root" \
   --cross-file "$build_root/android-aarch64.ini" --buildtype release \
   -Dplatforms=android -Dandroid-stub=true -Dandroid-libbacktrace=disabled \
   -Dplatform-sdk-version=33 -Dvulkan-drivers=freedreno -Dfreedreno-kmds=kgsl \

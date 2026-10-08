@@ -1568,6 +1568,7 @@ tu_DestroyImageView(VkDevice _device,
  */
 void
 tu_fragment_density_map_sample(const struct tu_image_view *fdm,
+                               const uint8_t *snapshot,
                                int32_t x, int32_t y,
                                uint32_t width, uint32_t height,
                                uint32_t layer,
@@ -1590,7 +1591,17 @@ tu_fragment_density_map_sample(const struct tu_image_view *fdm,
    unsigned cpp = fdm->image->layout[0].cpp;
    unsigned pitch = fdm->view.pitch;
 
-   void *pixel = (char *)fdm->image->map + fdm->view.offset + fdm->view.layer_size * layer + cpp * i + pitch * j;
+   if (fdm->vk.layer_count == 1)
+      layer = 0;
+
+   const void *pixel;
+   if (snapshot) {
+      size_t row_size = (size_t)fdm->vk.extent.width * cpp;
+      pixel = snapshot + row_size * (fdm->vk.extent.height * layer + j) + cpp * i;
+   } else {
+      pixel = (char *)fdm->image->map + fdm->view.offset +
+              fdm->view.layer_size * layer + cpp * i + pitch * j;
+   }
    float density_src[4], density[4];
    util_format_unpack_rgba(fdm->view.format, density_src, pixel, 1);
    pipe_swizzle_4f(density, density_src, fdm->swizzle);
@@ -1755,4 +1766,3 @@ tu_bind_sparse_image(struct tu_device *device, void *submit,
                          prev_bo_offset, bind_range);
    }
 }
-

@@ -21,6 +21,7 @@
 #include "tu_buffer.h"
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
+#include "tu_deferred.h"
 #include "tu_event.h"
 #include "tu_image.h"
 #include "tu_knl.h"
@@ -1622,6 +1623,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
    }
 
    bool bin_scale_en =
+      CHIP < A8XX &&
       cmd->device->physical_device->info->props.has_hw_bin_scaling &&
       layers <= MAX_HW_SCALED_VIEWS && !cmd->state.rp.shared_viewport &&
       bin_is_scaled;
@@ -1848,7 +1850,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
           * on the actual offset, and signficantly changing the performance
           * could result in jank between frames as the offset changes.
           */
-         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_scale_en;
+         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_is_scaled;
          bool subsampled_use_fast_store = non_subsampled_use_fast_store ||
             (tile->subsampled_views == tile->visible_views &&
              !tile->subsampled_border);
@@ -3468,6 +3470,9 @@ tu7_emit_concurrent_binning_gmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       cmd->state.rp.has_vtx_stats_query_in_rp ||
       cmd->state.prim_counters_running > 0;
 
+   disable_cb |= tu7_cb_disable_reason(cmd->fdm_bin_patchpoints.size != 0,
+                                       cmd, "FDM patchpoints");
+
    tu7_cb_disable_reason(disable_cb, cmd,
       "xfb/prim-gen/prim-counters/vtx-stats query is running");
    tu7_cb_disable_reason(!use_hw_binning, cmd, "hw binning disabled");
@@ -4253,6 +4258,8 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    }
 
    cmd_buffer->device = device;
+   if (device->vk.enabled_features.fragmentDensityMapDeferred)
+      vk_cmd_queue_init(&cmd_buffer->vk.cmd_queue);
 
    u_trace_init(&cmd_buffer->trace, &device->trace_context);
    u_trace_init(&cmd_buffer->rp_trace, &device->trace_context);
@@ -4356,6 +4363,7 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd_buffer->vis_stream_bos);
    util_dynarray_fini(&cmd_buffer->vis_stream_cs_bos);
 
+   ralloc_free(cmd_buffer->fdm_snapshots_ctx);
    vk_command_buffer_finish(&cmd_buffer->vk);
    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer);
 }
@@ -4372,6 +4380,12 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       status_check_result = tu_cmd_buffer_status_check_idle(cmd_buffer);
 
     vk_command_buffer_reset(&cmd_buffer->vk);
+    ralloc_free(cmd_buffer->fdm_snapshots_ctx);
+    cmd_buffer->fdm_snapshots_ctx = nullptr;
+    cmd_buffer->fdm_snapshots = cmd_buffer->fdm_snapshots_tail = nullptr;
+    cmd_buffer->fdm_host_snapshot = nullptr;
+    cmd_buffer->deferred_recording = false;
+    cmd_buffer->deferred_replaying = false;
 
     if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS) &&
         status_check_result != VK_SUCCESS) {
@@ -4476,6 +4490,29 @@ tu_cache_init(struct tu_cache_state *cache)
  * tracking the CCU state. It's used for the driver to insert its own command
  * buffer in the middle of a submit.
  */
+/* TU_DEBUG=cmd_no_preempt: keep the CP from preempting inside an application
+ * primary command buffer, so it can only be switched out at IB boundaries.
+ * Diagnostic for mid-IB (level 1) preemption save/restore problems; A7XX+
+ * SQE implements CP_SCOPE_CNTL. Only ever emitted into the BR-executed main
+ * stream, never into draw-state groups (the DDE traps on it).
+ */
+static bool
+tu_cmd_no_preempt(const struct tu_cmd_buffer *cmd_buffer)
+{
+   return TU_DEBUG_START(CMD_NO_PREEMPT) &&
+          cmd_buffer->device->physical_device->info->chip >= 7 &&
+          cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+          cmd_buffer->queue_family_index == TU_QUEUE_GENERAL;
+}
+
+static void
+tu_emit_preempt_scope(struct tu_cs *cs, bool disable)
+{
+   tu_cs_emit_pkt7(cs, CP_SCOPE_CNTL, 1);
+   tu_cs_emit(cs, CP_SCOPE_CNTL_0(.disable_preemption = disable,
+                                  .scope = INTERRUPTS).value);
+}
+
 VkResult
 tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
                     const VkCommandBufferBeginInfo *pBeginInfo)
@@ -4519,11 +4556,20 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    if (result != VK_SUCCESS)
       return result;
 
+   if (cmd_buffer->device->vk.enabled_features.fragmentDensityMapDeferred) {
+      cmd_buffer->deferred_recording =
+         cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+      if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+         return VK_SUCCESS;
+   }
+
    /* setup initial configuration into command buffer */
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       switch (cmd_buffer->queue_family_index) {
       case TU_QUEUE_GENERAL:
          TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
+         if (tu_cmd_no_preempt(cmd_buffer))
+            tu_emit_preempt_scope(&cmd_buffer->cs, true);
          result = tu_cs_get_status(&cmd_buffer->cs);
          if (result != VK_SUCCESS)
             return vk_command_buffer_set_error(&cmd_buffer->vk, result);
@@ -5440,6 +5486,15 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
 
+   if (cmd_buffer->deferred_recording) {
+      cmd_buffer->deferred_recording = false;
+      if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+         return vk_command_buffer_end(&cmd_buffer->vk);
+      cmd_buffer->deferred_replaying = true;
+      tu_deferred_execute(cmd_buffer, cmd_buffer);
+      cmd_buffer->deferred_replaying = false;
+   }
+
    /* We currently flush CCU at the end of the command buffer, like
     * what the blob does. There's implicit synchronization around every
     * vkQueueSubmit, but the kernel only flushes the UCHE, and we don't
@@ -5481,6 +5536,9 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
 
    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
       tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_IDLE);
+
+   if (tu_cmd_no_preempt(cmd_buffer))
+      tu_emit_preempt_scope(&cmd_buffer->cs, false);
 
    tu_cs_end(&cmd_buffer->cs);
    tu_cs_end(&cmd_buffer->draw_cs);
@@ -6452,6 +6510,14 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
    VkResult result;
 
    assert(commandBufferCount > 0);
+
+   if (cmd->device->vk.enabled_features.fragmentDensityMapDeferred) {
+      for (uint32_t i = 0; i < commandBufferCount; i++) {
+         VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
+         tu_deferred_execute(cmd, secondary);
+      }
+      return;
+   }
 
    /* Emit any pending flushes. */
    if (cmd->state.pass) {
