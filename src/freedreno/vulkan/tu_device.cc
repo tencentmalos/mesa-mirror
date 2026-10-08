@@ -35,6 +35,7 @@
 #include "tu_acceleration_structure.h"
 #include "tu_clear_blit.h"
 #include "tu_cmd_buffer.h"
+#include "tu_deferred.h"
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_dynamic_rendering.h"
@@ -798,7 +799,8 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->fragmentDensityMap = true;
    features->fragmentDensityMapDynamic = false;
    features->fragmentDensityMapNonSubsampledImages = true;
-   features->fragmentDensityMapDeferred = false;
+   features->fragmentDensityMapDeferred =
+      debug_get_bool_option("TU_FDM2_DEFERRED", false);
 
    /* VK_EXT_global_priority_query */
    features->globalPriorityQuery = true;
@@ -2916,6 +2918,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       return vk_startup_errorf(physical_device->instance, result,
                                "vk_device_init failed");
    }
+
+   if (device->vk.enabled_features.fragmentDensityMapDeferred)
+      tu_init_deferred_dispatch(device);
 
    device->instance = physical_device->instance;
    device->physical_device = physical_device;
