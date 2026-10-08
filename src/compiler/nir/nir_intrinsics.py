@@ -1644,6 +1644,9 @@ system_value("tess_param_base_ir3", 2)
 system_value("tcs_header_ir3", 1)
 system_value("rel_patch_id_ir3", 1)
 
+# Base address of turnip's mesh shading ring.
+system_value("mesh_ring_ir3", 2)
+
 # System values for freedreno compute shaders.
 system_value("subgroup_id_shift_ir3", 1)
 

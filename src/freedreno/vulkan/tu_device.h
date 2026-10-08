@@ -380,6 +380,12 @@ struct tu_device
    /* Lazily allocated, protected by the device mutex. */
    struct tu_bo *tess_bo;
 
+   /* Mesh shading emulation state, created with the first mesh pipeline and
+    * protected by the device mutex.
+    */
+   struct tu_bo *mesh_ring;
+   struct tu_shader *mesh_setup;
+
    struct ir3_shader_variant *global_shader_variants[GLOBAL_SH_COUNT];
    struct ir3_shader *global_shaders[GLOBAL_SH_COUNT];
    uint64_t global_shader_va[GLOBAL_SH_COUNT];

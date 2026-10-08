@@ -200,6 +200,17 @@ is_kgsl(struct tu_instance *instance)
    return strcmp(instance->knl->name, "kgsl") == 0;
 }
 
+/* Mesh and task shaders are emulated with compute dispatches inside
+ * sysmem render passes.
+ */
+static bool
+tu_has_mesh_shader(const struct tu_physical_device *device)
+{
+   return debug_get_bool_option("TU_EXPERIMENTAL_MESH", false) &&
+          device->info->chip == 8 &&
+          device->info->cs_shared_mem_size >= 32 * 1024;
+}
+
 static uint32_t
 tu_subgroup_size(const struct tu_physical_device *device)
 {
@@ -373,6 +384,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = true,
+      .EXT_mesh_shader = tu_has_mesh_shader(device),
       .EXT_multi_draw = true,
       .EXT_multisampled_render_to_single_sampled = true,
       .EXT_mutable_descriptor_type = true,
@@ -827,6 +839,13 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->memoryMapRangePlaced = false;
    features->memoryUnmapReserve = true;
 
+   /* VK_EXT_mesh_shader */
+   features->taskShader = false;
+   features->meshShader = tu_has_mesh_shader(pdevice);
+   features->multiviewMeshShader = false;
+   features->primitiveFragmentShadingRateMeshShader = false;
+   features->meshShaderQueries = false;
+
    /* VK_EXT_multi_draw */
    features->multiDraw = true;
 
@@ -991,6 +1010,10 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
                                     VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR |
                                     VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
                                     VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+   if (tu_has_mesh_shader(pdevice)) {
+      p->subgroupSupportedStages |=
+         VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+   }
    if (pdevice->info->props.has_getfiberid) {
       p->subgroupSupportedStages |= VK_SHADER_STAGE_ALL_GRAPHICS;
       p->subgroupSupportedOperations |= VK_SUBGROUP_FEATURE_QUAD_BIT;
@@ -1127,7 +1150,8 @@ tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
    p->requiredSubgroupSizeStages =
       p->minSubgroupSize == p->maxSubgroupSize
          ? VK_SHADER_STAGE_ALL
-         : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+         : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT);
 
    p->maxInlineUniformBlockSize = MAX_INLINE_UBO_RANGE;
    p->maxPerStageDescriptorInlineUniformBlocks = MAX_INLINE_UBOS;
@@ -1453,6 +1477,44 @@ tu_get_properties(struct tu_physical_device *pdevice,
    /* VK_EXT_map_memory_placed */
    os_get_page_size(&os_page_size);
    props->minPlacedMemoryMapAlignment = os_page_size;
+
+   /* VK_EXT_mesh_shader */
+   props->maxTaskWorkGroupTotalCount = 1u << 22;
+   props->maxTaskWorkGroupCount[0] = 65535;
+   props->maxTaskWorkGroupCount[1] = 65535;
+   props->maxTaskWorkGroupCount[2] = 65535;
+   props->maxTaskWorkGroupInvocations = 128;
+   props->maxTaskWorkGroupSize[0] = 128;
+   props->maxTaskWorkGroupSize[1] = 128;
+   props->maxTaskWorkGroupSize[2] = 128;
+   props->maxTaskPayloadSize = 16384;
+   props->maxTaskSharedMemorySize = 32768;
+   props->maxTaskPayloadAndSharedMemorySize = 32768;
+   props->maxMeshWorkGroupTotalCount = 1u << 22;
+   props->maxMeshWorkGroupCount[0] = 65535;
+   props->maxMeshWorkGroupCount[1] = 65535;
+   props->maxMeshWorkGroupCount[2] = 65535;
+   props->maxMeshWorkGroupInvocations = 128;
+   props->maxMeshWorkGroupSize[0] = 128;
+   props->maxMeshWorkGroupSize[1] = 128;
+   props->maxMeshWorkGroupSize[2] = 128;
+   props->maxMeshSharedMemorySize = 28672;
+   props->maxMeshPayloadAndSharedMemorySize = 16384 + 28672;
+   props->maxMeshOutputMemorySize = 32768;
+   props->maxMeshPayloadAndOutputMemorySize = 16384 + 32768;
+   props->maxMeshOutputComponents = 128;
+   props->maxMeshOutputVertices = 256;
+   props->maxMeshOutputPrimitives = 256;
+   props->maxMeshOutputLayers = 8;
+   props->maxMeshMultiviewViewCount = 1;
+   props->meshOutputPerVertexGranularity = 1;
+   props->meshOutputPerPrimitiveGranularity = 1;
+   props->maxPreferredTaskWorkGroupInvocations = 64;
+   props->maxPreferredMeshWorkGroupInvocations = 128;
+   props->prefersLocalInvocationVertexOutput = true;
+   props->prefersLocalInvocationPrimitiveOutput = true;
+   props->prefersCompactVertexOutput = true;
+   props->prefersCompactPrimitiveOutput = true;
 
    /* VK_EXT_multi_draw */
    props->maxMultiDrawCount = 2048;
@@ -3385,6 +3447,11 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    tu_destroy_clear_blit_shaders(device);
 
    tu_destroy_empty_shaders(device);
+
+   if (device->mesh_setup)
+      vk_pipeline_cache_object_unref(&device->vk, &device->mesh_setup->base);
+   if (device->mesh_ring)
+      tu_bo_finish(device, device->mesh_ring);
 
    tu_destroy_dynamic_rendering(device);
 

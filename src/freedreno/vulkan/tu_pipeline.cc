@@ -53,6 +53,17 @@ emit_load_state(struct tu_cs *cs, unsigned opcode, enum a6xx_state_type st,
    tu_cs_emit_qw(cs, offset | (base << 28));
 }
 
+/* Task and mesh shaders run as compute dispatches during the draw, so their
+ * descriptors are not prefetched with the graphics stages.
+ */
+static VkShaderStageFlags
+load_state_stages(const struct tu_pipeline *pipeline,
+                  const struct tu_descriptor_set_binding_layout *binding)
+{
+   return pipeline->active_stages & binding->shader_stages &
+          ~(VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT);
+}
+
 static unsigned
 tu6_load_state_size(struct tu_pipeline *pipeline,
                     struct tu_pipeline_layout *layout)
@@ -68,7 +79,7 @@ tu6_load_state_size(struct tu_pipeline *pipeline,
          struct tu_descriptor_set_binding_layout *binding = &set_layout->binding[j];
          unsigned count = 0;
          /* See comment in tu6_emit_load_state(). */
-         VkShaderStageFlags stages = pipeline->active_stages & binding->shader_stages;
+         VkShaderStageFlags stages = load_state_stages(pipeline, binding);
          unsigned stage_count = util_bitcount(stages);
 
          if (!binding->array_size)
@@ -155,7 +166,7 @@ tu6_emit_load_state(struct tu_device *device,
           * stages aren't present in a used pipeline.  We don't want to emit
           * loads for unused descriptors.
           */
-         VkShaderStageFlags stages = pipeline->active_stages & binding->shader_stages;
+         VkShaderStageFlags stages = load_state_stages(pipeline, binding);
          unsigned count = binding->array_size;
 
          /* If this is a variable-count descriptor, then the array_size is an
@@ -409,7 +420,7 @@ tu6_emit_xs_config(struct tu_crb &crb, struct tu_shader_stages stages)
 }
 TU_GENX(tu6_emit_xs_config);
 
-static void
+void
 tu6_emit_dynamic_offset(struct tu_cs *cs,
                         const struct ir3_shader_variant *xs,
                         const struct tu_shader *shader,
@@ -1561,7 +1572,7 @@ tu_hash_shaders(unsigned char *hash,
    if (layout)
       _mesa_blake3_update(&ctx, layout->blake3, sizeof(layout->blake3));
 
-   for (int i = 0; i < MESA_SHADER_STAGES; ++i) {
+   for (int i = 0; i < MESA_SHADER_MESH_STAGES; ++i) {
       if (stages[i] || nir[i]) {
          tu_hash_stage(&ctx, pipeline_flags, stages[i], nir[i], &keys[i]);
       }
@@ -1735,13 +1746,13 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
                                     struct tu_pipeline *pipeline)
 {
    VkResult result = VK_SUCCESS;
-   const VkPipelineShaderStageCreateInfo *stage_infos[MESA_SHADER_STAGES] = {
+   const VkPipelineShaderStageCreateInfo *stage_infos[MESA_SHADER_MESH_STAGES] = {
       NULL
    };
    VkPipelineCreationFeedback pipeline_feedback = {
       .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT,
    };
-   VkPipelineCreationFeedback stage_feedbacks[MESA_SHADER_STAGES] = { 0 };
+   VkPipelineCreationFeedback stage_feedbacks[MESA_SHADER_MESH_STAGES] = { 0 };
 
    const bool executable_info =
       builder->create_flags &
@@ -1752,6 +1763,12 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
       VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
 
    int64_t pipeline_start = os_time_get_nano();
+
+   if (builder->active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) {
+      result = tu_init_mesh_shading(builder->device);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    const VkPipelineCreationFeedbackCreateInfo *creation_feedback =
       vk_find_struct_const(builder->create_info->pNext, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
@@ -1963,9 +1980,11 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
       unsigned char shader_blake3[BLAKE3_KEY_LEN + 1];
       memcpy(shader_blake3, pipeline_blake3, sizeof(pipeline_blake3));
 
+      bool has_mesh = stage_infos[MESA_SHADER_MESH] || nir[MESA_SHADER_MESH];
       for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < ARRAY_SIZE(nir);
            stage = (mesa_shader_stage) (stage + 1)) {
-         if (stage_infos[stage] || nir[stage]) {
+         if (stage_infos[stage] || nir[stage] ||
+             (stage == MESA_SHADER_VERTEX && has_mesh)) {
             bool shader_application_cache_hit;
             shader_blake3[BLAKE3_KEY_LEN] = (unsigned char) stage;
             shaders[stage] =
