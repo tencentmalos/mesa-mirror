@@ -381,7 +381,8 @@ radv_init_update_scratch(VkCommandBuffer commandBuffer, const struct vk_accelera
 
       /* Prepare ready counts for internal nodes */
       radv_fill_memory(cmd_buffer, scratch + layout.internal_ready_count_offset,
-                       layout.size - layout.internal_ready_count_offset, 0x0, VK_ADDRESS_COPY_DEVICE_LOCAL_BIT_KHR);
+                       layout.size - layout.internal_ready_count_offset, 0x0, VK_ADDRESS_COPY_DEVICE_LOCAL_BIT_KHR,
+                       false);
    }
 
    for (uint32_t i = 0; i < build_count; i++) {
@@ -584,7 +585,7 @@ radv_encode_as(VkCommandBuffer commandBuffer, struct vk_device *vk_device, struc
       radv_update_memory_cp(cmd_buffer, intermediate_header_addr + offsetof(struct vk_ir_header, dst_node_offset),
                             &dst_offset, sizeof(uint32_t));
       if (radv_device_physical(device)->info.cp_sdma_ge_use_system_memory_scope)
-         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_INV_L2;
+         cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2;
 
       const struct encode_args args = {
          .intermediate_bvh = intermediate_bvh_addr,
@@ -670,7 +671,7 @@ radv_encode_as_gfx12(VkCommandBuffer commandBuffer, struct vk_device *vk_device,
       radv_update_memory_cp(cmd_buffer, intermediate_header_addr + offsetof(struct vk_ir_header, sync_data),
                             update_data, header_update_size);
       if (radv_device_physical(device)->info.cp_sdma_ge_use_system_memory_scope)
-         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_INV_L2;
+         cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2;
 
       const struct encode_gfx12_args args = {
          .intermediate_bvh = intermediate_bvh_addr,
@@ -1075,8 +1076,10 @@ radv_flush_buffer_write_cp(VkCommandBuffer commandBuffer)
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
 
+   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CP_DMA;
+
    if (pdev->info.cp_sdma_ge_use_system_memory_scope)
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_INV_L2;
+      cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2;
 }
 
 static void
@@ -1090,7 +1093,7 @@ static void
 radv_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr, VkDeviceSize size, uint32_t data)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
-   radv_fill_memory(cmd_buffer, addr, size, data, VK_ADDRESS_COPY_DEVICE_LOCAL_BIT_KHR);
+   radv_fill_memory(cmd_buffer, addr, size, data, VK_ADDRESS_COPY_DEVICE_LOCAL_BIT_KHR, false);
 }
 
 static void

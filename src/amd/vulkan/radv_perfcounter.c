@@ -99,7 +99,7 @@ enum radv_perfcounter_op {
 #define G_REG_OFFSET(x)    ((x) & 0xFFFF)
 #define S_REG_INSTANCES(x) ((x) << 16)
 #define G_REG_INSTANCES(x) (((x) >> 16) & 0x7FFF)
-#define S_REG_CONSTANT(x)  ((x) << 31)
+#define S_REG_CONSTANT(x)  ((unsigned)(x) << 31)
 #define G_REG_CONSTANT(x)  ((x) >> 31)
 
 struct radv_perfcounter_impl {
@@ -650,13 +650,12 @@ radv_pc_wait_idle(struct radv_cmd_buffer *cmd_buffer)
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
-   enum radv_cmd_flush_bits flush_bits = RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
-                                         RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_FLUSH_AND_INV_CB |
-                                         RADV_CMD_FLAG_FLUSH_AND_INV_DB | RADV_CMD_FLAG_PFP_SYNC_ME;
+   enum ac_barrier_flags flush_bits = AC_BARRIER_SYNC_CS | AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS |
+                                      AC_BARRIER_SYNC_AND_INV_CB | AC_BARRIER_SYNC_AND_INV_DB | AC_BARRIER_PFP_SYNC_ME;
    enum ac_rgp_flush_bits sqtt_flush_bits = 0;
 
-   radv_cs_emit_cache_flush(device->ws, cs, pdev->info.gfx_level, &cmd_buffer->gfx9_fence_idx,
-                            cmd_buffer->gfx9_fence_va, flush_bits, &sqtt_flush_bits, RADV_PWS_ACQUIRE_POINT_PFP, 0);
+   radv_cs_emit_cache_flush(device->ws, cs, pdev->info.gfx_level, &cmd_buffer->eop_fence_idx, cmd_buffer->eop_fence_va,
+                            flush_bits, &sqtt_flush_bits, AC_PWS_ACQUIRE_POINT_PFP, 0);
 }
 
 /**
@@ -837,8 +836,8 @@ radv_pc_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query_pool 
    uint64_t perf_ctr_va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_FENCE_OFFSET;
    radv_cs_emit_write_event_eop(cs, pdev->info.gfx_level, V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM,
                                 EOP_INT_SEL_SEND_DATA_AFTER_WR_CONFIRM, EOP_DATA_SEL_VALUE_32BIT, perf_ctr_va, 1,
-                                cmd_buffer->gfx9_fence_va);
-   radv_cp_wait_mem(cs, WAIT_REG_MEM_EQUAL, perf_ctr_va, 1, 0xffffffff);
+                                cmd_buffer->eop_fence_va);
+   ac_emit_cp_wait_mem(cs->b, perf_ctr_va, 1, 0xffffffff, WAIT_REG_MEM_EQUAL);
 
    radv_pc_wait_idle(cmd_buffer);
    radv_pc_stop_and_sample(cmd_buffer, pool, va, true);

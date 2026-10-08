@@ -384,7 +384,7 @@ choose_isl_tiling_flags(const struct intel_device_info *devinfo,
          /* Disable support for tilings that are not supported by ISL's
           * tiled-memcpy functions.
           */
-         flags = ~(ISL_TILING_STD_64_MASK | ISL_TILING_STD_Y_MASK);
+         flags = ~ISL_TILING_STANDARD_MASK;
       } else {
          flags = ISL_TILING_ANY_MASK;
       }
@@ -959,6 +959,56 @@ add_video_buffers(struct anv_device *device,
                            ANV_OFFSET_IMPLICIT, size, 64, &image->vid_dmv_top_surface);
    if (ok != VK_SUCCESS)
       return ok;
+
+   /* VDENC HME uses downscaled reconstructed references: H.264 needs only
+    * the 4x surface, H.265 and AV1 use both the 8x and 4x. A profile-less
+    * DPB image takes the worst case (both).
+    */
+   if (image->vk.usage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR) {
+      bool need_8x = independent_profile;
+      bool need_4x = independent_profile;
+
+      if (!independent_profile) {
+         for (unsigned i = 0; i < profile_list->profileCount; i++) {
+            switch (profile_list->pProfiles[i].videoCodecOperation) {
+            case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR:
+               need_4x = true;
+               break;
+            case VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR:
+            case VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR:
+               need_8x = true;
+               need_4x = true;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+
+      struct anv_video_enc_ds_layout ds =
+         anv_video_get_enc_ds_layout(image->vk.extent.width,
+                                     image->vk.extent.height);
+
+      if (need_8x) {
+         image->vid_ds_8x_array_pitch_B = ds.slice8_B;
+         ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                                 ANV_OFFSET_IMPLICIT,
+                                 (uint64_t)ds.slice8_B * image->vk.array_layers,
+                                 4096, &image->vid_ds_8x_surface);
+         if (ok != VK_SUCCESS)
+            return ok;
+      }
+
+      if (need_4x) {
+         image->vid_ds_4x_array_pitch_B = ds.slice4_B;
+         ok = image_binding_grow(device, image, ANV_IMAGE_MEMORY_BINDING_PRIVATE,
+                                 ANV_OFFSET_IMPLICIT,
+                                 (uint64_t)ds.slice4_B * image->vk.array_layers,
+                                 4096, &image->vid_ds_4x_surface);
+         if (ok != VK_SUCCESS)
+            return ok;
+      }
+   }
 
    size = av1_cdf_max_num_bytes;
 
@@ -1689,6 +1739,19 @@ alloc_private_binding(struct anv_device *device,
       }
    }
 
+   if (create_info->flags & VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT) {
+      alloc_flags |= ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS;
+
+      const VkOpaqueCaptureDataCreateInfoEXT *opaque_info =
+         vk_find_struct_const(create_info->pNext,
+                              OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT);
+      if (opaque_info) {
+         const struct anv_image_opaque_capture_data *explicit_addresses =
+            opaque_info->pData->address;
+         explicit_address = explicit_addresses->private_binding;
+      }
+   }
+
    VkResult result = anv_device_alloc_bo(device, "image-binding-private",
                                          binding->memory_range.size,
                                          alloc_flags, explicit_address,
@@ -1737,7 +1800,7 @@ anv_image_init_sparse_bindings(struct anv_image *image,
    }
 
    if (image->vk.create_flags & VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT) {
-      alloc_flags |= ANV_BO_ALLOC_FIXED_ADDRESS;
+      alloc_flags |= ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS;
 
       const VkOpaqueCaptureDataCreateInfoEXT *opaque_info =
          vk_find_struct_const(create_info->vk_info->pNext,
@@ -1746,7 +1809,7 @@ anv_image_init_sparse_bindings(struct anv_image *image,
          assert(opaque_info->pData[0].size ==
                 sizeof(struct anv_image_opaque_capture_data));
          explicit_addresses =
-            (const struct anv_image_opaque_capture_data *)opaque_info->pData;
+            (const struct anv_image_opaque_capture_data *)opaque_info->pData->address;
       }
    }
 
@@ -1921,13 +1984,16 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
    }
 
-   /* Disable aux if image supports export without modifiers. */
+   /* Disable aux and normalize tiling decisions if an image supports export
+    * without modifiers.
+    */
    if (image->vk.external_handle_types != 0 &&
        image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       anv_perf_warn(VK_LOG_OBJS(&image->vk.base),
                     "Disabling aux: "
                     "external image without DRM modifier");
       isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
+      isl_extra_usage_flags |= ISL_SURF_USAGE_PREFER_4K_ALIGNMENT;
    }
 
    if (device->queue_count > 1) {
@@ -2330,9 +2396,9 @@ anv_image_finish(struct anv_image *image)
    struct anv_bo *private_bo = image->bindings[ANV_IMAGE_MEMORY_BINDING_PRIVATE].address.bo;
    if (private_bo) {
       if (image->device_registered) {
-         pthread_mutex_lock(&device->mutex);
+         simple_mtx_lock(&device->mutex);
          list_del(&image->link);
-         pthread_mutex_unlock(&device->mutex);
+         simple_mtx_unlock(&device->mutex);
       }
       ANV_DMR_BO_FREE(&image->vk.base, private_bo);
       anv_device_release_bo(device, private_bo);
@@ -3292,7 +3358,7 @@ anv_bind_image_memory(struct anv_device *device,
 
    if (image->bindings[ANV_IMAGE_MEMORY_BINDING_PRIVATE].address.bo != NULL &&
        !image->device_registered) {
-      pthread_mutex_lock(&device->mutex);
+      simple_mtx_lock(&device->mutex);
 
       /* For the purpose of enabling compression with
        * VK_IMAGE_CREATE_ALIAS_BIT, try to replace the image's private BO with
@@ -3331,7 +3397,7 @@ anv_bind_image_memory(struct anv_device *device,
       }
 
       list_addtail(&image->link, &device->image_private_objects);
-      pthread_mutex_unlock(&device->mutex);
+      simple_mtx_unlock(&device->mutex);
       image->device_registered = true;
    }
 
@@ -4439,22 +4505,19 @@ VkResult anv_GetImageOpaqueCaptureDataEXT(
     const VkImage*                              pImages,
     VkHostAddressRangeEXT*                      pDatas)
 {
-   ANV_FROM_HANDLE(anv_device, device, _device);
-
    for (uint32_t i = 0; i < imageCount; i++) {
       ANV_FROM_HANDLE(anv_image, image, pImages[i]);
 
-      if (pDatas[i].size < sizeof(uint64_t))
-         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-      if (anv_image_is_sparse(image) &&
-          (image->vk.create_flags & VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT)) {
-         *((uint64_t *)pDatas[i].address) = anv_address_physical(
-            image->bindings[ANV_IMAGE_MEMORY_BINDING_MAIN].address);
-      } else {
-         *((uint64_t *)pDatas[i].address) = 0;
+      struct anv_image_opaque_capture_data bound_addresses;
+      memset(&bound_addresses, 0, sizeof(bound_addresses));
+      /* Main binding is the sparse VA, we should return 0 consistently for non-sparse. */
+      if (anv_image_is_sparse(image)) {
+         bound_addresses.main_binding =
+            anv_address_physical(image->bindings[ANV_IMAGE_MEMORY_BINDING_MAIN].address);
       }
-      pDatas[i].size = sizeof(uint64_t);
+      bound_addresses.private_binding =
+         anv_address_physical(image->bindings[ANV_IMAGE_MEMORY_BINDING_PRIVATE].address);
+      memcpy(pDatas[i].address, &bound_addresses, sizeof(struct anv_image_opaque_capture_data));
    }
 
    return VK_SUCCESS;

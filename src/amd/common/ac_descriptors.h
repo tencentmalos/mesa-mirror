@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-#define DUPL_16BITS_IN_DWORD(x) (((x) << 16) | (x))
-#define DUPL_8BITS_IN_DWORD(x) (((x) << 24) | ((x) << 16) | ((x) << 8) | (x))
+#define DUPL_16BITS_IN_DWORD(x) (((uint32_t)(x) << 16) | (x))
+#define DUPL_8BITS_IN_DWORD(x) (((uint32_t)(x) << 24) | ((x) << 16) | ((x) << 8) | (x))
 #define DUPL_4BITS_IN_DWORD(x) DUPL_8BITS_IN_DWORD((x) | ((x) << 4))
 
 #define DCC_CODE                       DUPL_8BITS_IN_DWORD
@@ -373,11 +373,6 @@ void
 ac_build_texture_descriptor(const struct radeon_info *info,
                             const struct ac_texture_state *state,
                             uint32_t desc[8]);
-
-uint32_t
-ac_tile_mode_index(const struct radeon_surf *surf,
-                   unsigned level,
-                   bool stencil);
 
 struct ac_mutable_tex_state {
    const struct radeon_surf *surf;

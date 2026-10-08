@@ -1,6 +1,7 @@
 /*
  * Copyright © 2016 Red Hat.
  * Copyright © 2016 Bas Nieuwenhuizen
+ * Copyright © 2026 Advanced Micro Devices, Inc.
  *
  * based in part on anv driver which is:
  * Copyright © 2015 Intel Corporation
@@ -24,6 +25,7 @@
 #include "radv_radeon_winsys.h"
 #include "radv_video.h"
 #include "radv_wsi.h"
+#include "vk_android.h"
 #include "vk_debug_utils.h"
 #include "vk_format.h"
 #include "vk_log.h"
@@ -655,11 +657,6 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
       flags |= RADEON_SURF_PRT | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE | RADEON_SURF_DISABLE_DCC;
    }
 
-   if (image->queue_family_mask & BITFIELD_BIT(RADV_QUEUE_TRANSFER)) {
-      if (!pdev->info.sdma_supports_compression)
-         flags |= RADEON_SURF_DISABLE_DCC | RADEON_SURF_NO_HTILE;
-   }
-
    /* Disable DCC for VRS rate images because the hw can't handle compression. */
    if (image->vk.usage & VK_IMAGE_USAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
       flags |= RADEON_SURF_VRS_RATE | RADEON_SURF_DISABLE_DCC;
@@ -794,15 +791,6 @@ radv_image_bo_set_metadata(struct radv_device *device, struct radv_image *image,
    device->ws->buffer_set_metadata(device->ws, bo, &md);
 }
 
-void
-radv_image_override_offset_stride(struct radv_device *device, struct radv_image *image, uint64_t offset,
-                                  uint32_t stride)
-{
-   const struct radv_physical_device *pdev = radv_device_physical(device);
-   ac_surface_override_offset_stride(&pdev->info, &image->planes[0].surface, image->vk.array_layers,
-                                     image->vk.mip_levels, offset, stride);
-}
-
 static void
 radv_image_alloc_single_sample_cmask(const struct radv_device *device, const struct radv_image *image,
                                      struct radeon_surf *surf)
@@ -856,7 +844,8 @@ radv_image_alloc_values(const struct radv_device *device, struct radv_image *ima
 
    if (pdev->info.gfx_level == GFX12) {
       /* Allocate HiZ metadata when the image has depth/stencil aspects to implement a workaround. */
-      if (pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_FULL && radv_image_has_hiz(image) &&
+      if ((pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_FULL || pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_FULL_REZ) &&
+          radv_image_has_hiz(image) &&
           (image->vk.aspects == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
          image->hiz_metadata_offset = image->size;
          image->size += image->vk.mip_levels * 4;
@@ -1219,8 +1208,7 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
             ac_surface_zero_dcc_fields(&image->planes[0].surface);
       }
 
-      if (pdev->info.gfx_level >= GFX12 &&
-          (!radv_surface_has_scanout(device, &create_info) || pdev->info.gfx12_supports_display_dcc)) {
+      if (pdev->info.gfx_level >= GFX12) {
          const enum pipe_format format = radv_format_to_pipe_format(image->vk.format);
 
          /* Set DCC tilings for both color and depth/stencil. */
@@ -1299,10 +1287,17 @@ radv_destroy_image(struct radv_device *device, const VkAllocationCallbacks *pAll
    if ((image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR) && image->bindings[0].bo)
       radv_bo_destroy(device, &image->vk.base, image->bindings[0].bo);
 
-   if (image->owned_memory != VK_NULL_HANDLE) {
-      VK_FROM_HANDLE(radv_device_memory, mem, image->owned_memory);
-      radv_free_memory(device, pAllocator, mem);
+#if DETECT_OS_ANDROID
+   /* Bind-time ANB memory is allocated with the device allocator because
+    * vkBindImageMemory2() has no allocation callbacks. Create-time ANB is
+    * allocated with vkCreateImage()'s pAllocator and is freed by
+    * vk_image_destroy().
+    */
+   if (vk_image_is_android_native_buffer_alias(&image->vk) && image->vk.anb_memory != VK_NULL_HANDLE) {
+      radv_FreeMemory(radv_device_to_handle(device), image->vk.anb_memory, &device->vk.alloc);
+      image->vk.anb_memory = VK_NULL_HANDLE;
    }
+#endif
 
    for (uint32_t i = 0; i < ARRAY_SIZE(image->bindings); i++) {
       if (!image->bindings[i].addr)
@@ -1313,8 +1308,7 @@ radv_destroy_image(struct radv_device *device, const VkAllocationCallbacks *pAll
    }
 
    radv_rmv_log_resource_destroy(device, (uint64_t)radv_image_to_handle(image));
-   vk_image_finish(&image->vk);
-   vk_free2(&device->vk.alloc, pAllocator, image);
+   vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }
 
 static void
@@ -1374,7 +1368,27 @@ radv_select_modifier(const struct radv_device *dev, VkFormat format,
          }
       }
    }
-   UNREACHABLE("App specified an invalid modifier");
+
+   free(mods);
+   return VK_ERROR_UNKNOWN;
+}
+
+VkResult
+radv_image_init_layout(struct radv_device *device, struct radv_image_create_info create_info, uint64_t modifier,
+                       const struct VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_info,
+                       const struct VkVideoProfileListInfoKHR *profile_list, struct radv_image *image)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   const VkImageCreateInfo *pCreateInfo = create_info.vk_info;
+   VkFormat format = radv_select_android_external_format(pCreateInfo->pNext, pCreateInfo->format);
+   unsigned plane_count = radv_get_internal_plane_count(pdev, format);
+
+   for (unsigned plane = 0; plane < plane_count; ++plane) {
+      image->planes[plane].surface.flags = radv_get_surface_flags(device, image, plane, pCreateInfo, format);
+      image->planes[plane].surface.modifier = modifier;
+   }
+
+   return radv_image_create_layout(device, create_info, mod_info, profile_list, image);
 }
 
 VkResult
@@ -1427,28 +1441,31 @@ radv_image_create(VkDevice _device, const struct radv_image_create_info *create_
       result = radv_select_modifier(device, format, mod_list, &modifier);
       if (result != VK_SUCCESS) {
          radv_destroy_image(device, alloc, image);
-         return vk_error(device, result);
+         return vk_errorf(device, result, "Invalid modifier specified");
       }
    } else if (explicit_mod) {
       modifier = explicit_mod->drmFormatModifier;
    }
 
-   for (unsigned plane = 0; plane < plane_count; ++plane) {
-      image->planes[plane].surface.flags = radv_get_surface_flags(device, image, plane, pCreateInfo, format);
-      image->planes[plane].surface.modifier = modifier;
-   }
-
-   if (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) {
+   if ((image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) ||
+       vk_image_is_android_native_buffer_alias(&image->vk)) {
 #if DETECT_OS_ANDROID
-      image->vk.ahb_format = radv_ahb_format_for_vk_format(image->vk.format);
+      if (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)
+         image->vk.ahb_format = radv_ahb_format_for_vk_format(image->vk.format);
 #endif
+
+      result = vk_android_init_deferred_image(&device->vk, &image->vk, pCreateInfo, alloc);
+      if (result != VK_SUCCESS) {
+         radv_destroy_image(device, alloc, image);
+         return result;
+      }
 
       *pImage = radv_image_to_handle(image);
       assert(!(image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR));
       return VK_SUCCESS;
    }
 
-   result = radv_image_create_layout(device, *create_info, explicit_mod, profile_list, image);
+   result = radv_image_init_layout(device, *create_info, modifier, explicit_mod, profile_list, image);
    if (result != VK_SUCCESS) {
       radv_destroy_image(device, alloc, image);
       return result;
@@ -1544,9 +1561,7 @@ radv_layout_is_htile_compressed(const struct radv_device *device, const struct r
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
 
-   /* Don't compress exclusive images used on transfer queues when SDMA doesn't support HTILE.
-    * Note that HTILE is already disabled on concurrent images when not supported.
-    */
+   /* Don't compress exclusive images used on transfer queues when SDMA doesn't support HTILE. */
    if (queue_mask == BITFIELD_BIT(RADV_QUEUE_TRANSFER) && !pdev->info.sdma_supports_compression)
       return false;
 
@@ -1646,12 +1661,11 @@ radv_layout_dcc_compressed(const struct radv_device *device, const struct radv_i
 
    /* Don't compress compute transfer dst when image stores are not supported. */
    if ((layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL || layout == VK_IMAGE_LAYOUT_GENERAL) &&
-       (queue_mask & (1u << RADV_QUEUE_COMPUTE)) && !radv_image_compress_dcc_on_image_stores(device, image))
+       (queue_mask & (BITFIELD_BIT(RADV_QUEUE_COMPUTE) | BITFIELD_BIT(RADV_QUEUE_TRANSFER))) &&
+       !radv_image_compress_dcc_on_image_stores(device, image))
       return false;
 
-   /* Don't compress exclusive images used on transfer queues when SDMA doesn't support DCC.
-    * Note that DCC is already disabled on concurrent images when not supported.
-    */
+   /* Don't compress exclusive images used on transfer queues when SDMA doesn't support DCC. */
    if (queue_mask == BITFIELD_BIT(RADV_QUEUE_TRANSFER) && !pdev->info.sdma_supports_compression)
       return false;
 
@@ -1811,6 +1825,23 @@ radv_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImag
       }
 #endif
 
+#if DETECT_OS_ANDROID
+      if (!mem) {
+         VkDeviceMemory memory_h = VK_NULL_HANDLE;
+         VkResult result = radv_android_get_wsi_memory(_device, &pBindInfos[i], &memory_h);
+
+         if (result != VK_SUCCESS) {
+            if (status)
+               *status->pResult = result;
+            return result;
+         }
+
+         mem = radv_device_memory_from_handle(memory_h);
+         offset = 0;
+      }
+#endif
+      assert(mem);
+
       const VkBindImagePlaneMemoryInfo *plane_info = NULL;
       uint32_t bind_idx = 0;
 
@@ -1948,7 +1979,10 @@ radv_GetImageOpaqueCaptureDescriptorDataEXT(VkDevice device, const VkImageCaptur
 {
    VK_FROM_HANDLE(radv_image, image, pInfo->image);
 
-   *(uint64_t *)pData = image->bindings[0].addr;
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      memcpy(pData, &image->bindings[0].addr, sizeof(image->bindings[0].addr));
+   else
+      memset(pData, 0, sizeof(image->bindings[0].addr));
    return VK_SUCCESS;
 }
 
@@ -1959,7 +1993,10 @@ radv_GetImageOpaqueCaptureDataEXT(VkDevice device, uint32_t imageCount, const Vk
    for (uint32_t i = 0; i < imageCount; i++) {
       VK_FROM_HANDLE(radv_image, image, pImages[i]);
 
-      *(uint64_t *)pDatas[i].address = image->bindings[0].addr;
+      if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+         memcpy(pDatas[i].address, &image->bindings[0].addr, sizeof(image->bindings[0].addr));
+      else
+         memset(pDatas[i].address, 0, sizeof(image->bindings[0].addr));
    }
 
    return VK_SUCCESS;

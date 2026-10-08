@@ -1004,7 +1004,7 @@ brw_cs_get_dispatch_info(const struct intel_device_info *devinfo,
                             prog_data->local_size;
 
    int simd = -1;
-   if (intel_use_jay(devinfo, prog_data->base.stage)) {
+   if (prog_data->base.is_jay) {
       /* Currently Jay compiles only a single binary, just select that. In the
        * future this needs to get smarter.
        */
@@ -1128,4 +1128,23 @@ void brw_prog_data_init(struct brw_stage_prog_data *prog_data,
    prog_data->stage = params->nir->info.stage;
    prog_data->total_scratch = 0;
    prog_data->total_shared = params->nir->info.shared_size;
+}
+
+brw_reg
+brw_get_scratch64_surface_state_addr(brw_shader *shader)
+{
+   assert(shader->key->use_efficient_64bit);
+
+   if (shader->scratch64_surface.file != BAD_FILE)
+      return shader->scratch64_surface;
+
+   brw_builder ubld = brw_builder(shader).at_shader_start().exec_all().group(1, 0);
+
+   ubld.emit(SHADER_OPCODE_MOV_RELOC_IMM, brw_s0(BRW_TYPE_UD, 14),
+             brw_imm_ud(BRW_SHADER_RELOC_SCRATCH64_SURFACE_LOW), brw_imm_ud(0));
+   ubld.emit(SHADER_OPCODE_MOV_RELOC_IMM, brw_s0(BRW_TYPE_UD, 15),
+             brw_imm_ud(BRW_SHADER_RELOC_SCRATCH64_SURFACE_HIGH), brw_imm_ud(0));
+
+   shader->scratch64_surface = brw_s0(BRW_TYPE_UQ, 7);
+   return shader->scratch64_surface;
 }

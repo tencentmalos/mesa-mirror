@@ -1164,7 +1164,7 @@ system_value("blend_const_color_rgba8888_unorm", 1)
 system_value("blend_const_color_aaaa8888_unorm", 1)
 
 # System value for internal compute shaders in radeonsi.
-system_value("user_data_amd", 8)
+system_value("user_data_amd", 16)
 
 # Whether to use load_frag_coord_x() or load_pixel_coord() based on dynamic states.
 intrinsic("load_use_float_frag_coord_xy_amd", dest_comp=1, bit_sizes=[1],
@@ -1255,7 +1255,13 @@ intrinsic("load_sample_pos_from_id", src_comp=[1], dest_comp=2,
 # Takes an input attachment index and returns an ivec with the position in
 # input attachment space in .xy and the input attachment array index in .z.
 intrinsic("load_input_attachment_coord", src_comp=[1], dest_comp=3,
-          bit_sizes=[32], flags=[CAN_ELIMINATE, CAN_REORDER])
+          bit_sizes=[32], indices=[BASE], flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("load_depth_input_attachment_coord", dest_comp=3, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("load_stencil_input_attachment_coord", dest_comp=3, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Demote a subset of samples given by a specified sample mask. This acts like a
 # per-sample demote, or an inverted accumulating gl_SampleMask write.
@@ -1643,8 +1649,6 @@ system_value("subgroup_id_shift_ir3", 1)
 
 # System values for freedreno fragment shaders.
 intrinsic("load_frag_coord_unscaled_ir3", dest_comp=4,
-          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
-intrinsic("load_frag_coord_gmem_ir3", dest_comp=4,
           flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
 system_value("alpha_to_coverage_enable_ir3", 1)
 

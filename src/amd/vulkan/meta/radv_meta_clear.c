@@ -150,16 +150,6 @@ get_color_pipeline(struct radv_device *device, uint32_t samples, uint32_t frag_o
             .alphaToCoverageEnable = false,
             .alphaToOneEnable = false,
          },
-      .pDepthStencilState =
-         &(VkPipelineDepthStencilStateCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-            .depthTestEnable = false,
-            .depthWriteEnable = false,
-            .depthBoundsTestEnable = false,
-            .stencilTestEnable = false,
-            .minDepthBounds = 0.0f,
-            .maxDepthBounds = 1.0f,
-         },
       .pColorBlendState =
          &(VkPipelineColorBlendStateCreateInfo){
             .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -171,12 +161,11 @@ get_color_pipeline(struct radv_device *device, uint32_t samples, uint32_t frag_o
       .pDynamicState =
          &(VkPipelineDynamicStateCreateInfo){
             .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-            .dynamicStateCount = 3,
+            .dynamicStateCount = 2,
             .pDynamicStates =
                (VkDynamicState[]){
                   VK_DYNAMIC_STATE_VIEWPORT,
                   VK_DYNAMIC_STATE_SCISSOR,
-                  VK_DYNAMIC_STATE_STENCIL_REFERENCE,
                },
          },
       .layout = *layout_out,
@@ -483,7 +472,6 @@ emit_depthstencil_clear(struct radv_cmd_buffer *cmd_buffer, VkClearDepthStencilV
 
    radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &clear_value.depth);
 
-   uint32_t prev_reference = cmd_buffer->state.dynamic.vk.ds.stencil.front.reference;
    if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
       radv_meta_set_stencil_reference(cmd_buffer, VK_STENCIL_FACE_FRONT_BIT, clear_value.stencil);
    }
@@ -498,10 +486,6 @@ emit_depthstencil_clear(struct radv_cmd_buffer *cmd_buffer, VkClearDepthStencilV
          radv_CmdDraw(cmd_buffer_h, 3, 1, 0, i);
    } else {
       radv_CmdDraw(cmd_buffer_h, 3, clear_rect->layerCount, 0, clear_rect->baseArrayLayer);
-   }
-
-   if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
-      radv_meta_set_stencil_reference(cmd_buffer, VK_STENCIL_FACE_FRONT_BIT, prev_reference);
    }
 
    if (iview && radv_image_has_hiz_metadata(iview->image) && (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
@@ -596,7 +580,7 @@ clear_htile_mask(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *im
 
    radv_CmdDispatchBase(radv_cmd_buffer_to_handle(cmd_buffer), 0, 0, 0, block_count, 1, 1);
 
-   return RADV_CMD_FLAG_CS_PARTIAL_FLUSH | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+   return AC_BARRIER_SYNC_CS | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                                                  VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, NULL);
 }
 
@@ -724,7 +708,7 @@ radv_can_fast_clear_depth(struct radv_cmd_buffer *cmd_buffer, const struct radv_
 static void
 radv_fast_clear_depth(struct radv_cmd_buffer *cmd_buffer, const struct radv_image_view *iview,
                       VkClearDepthStencilValue clear_value, VkImageAspectFlags aspects,
-                      enum radv_cmd_flush_bits *pre_flush, enum radv_cmd_flush_bits *post_flush)
+                      enum ac_barrier_flags *pre_flush, enum ac_barrier_flags *post_flush)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    uint32_t clear_word, flush_bits;
@@ -740,7 +724,7 @@ radv_fast_clear_depth(struct radv_cmd_buffer *cmd_buffer, const struct radv_imag
    };
 
    if (pre_flush) {
-      enum radv_cmd_flush_bits bits =
+      enum ac_barrier_flags bits =
          radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0, iview->image, &range) |
          radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT, 0,
@@ -1052,7 +1036,7 @@ radv_clear_dcc_comp_to_single(struct radv_cmd_buffer *cmd_buffer, struct radv_im
       radv_image_view_finish(&iview);
    }
 
-   return RADV_CMD_FLAG_CS_PARTIAL_FLUSH | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+   return AC_BARRIER_SYNC_CS | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                                                  VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, NULL);
 }
 
@@ -1387,7 +1371,7 @@ radv_can_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_
 static void
 radv_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_image_view *iview,
                       const VkClearAttachment *clear_att, const VkClearRect *clear_rect,
-                      enum radv_cmd_flush_bits *pre_flush, enum radv_cmd_flush_bits *post_flush,
+                      enum ac_barrier_flags *pre_flush, enum ac_barrier_flags *post_flush,
                       uint32_t view_mask)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -1406,7 +1390,7 @@ radv_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_imag
    };
 
    if (pre_flush) {
-      enum radv_cmd_flush_bits bits =
+      enum ac_barrier_flags bits =
          radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, iview->image, NULL);
       cmd_buffer->state.flush_bits |= bits & ~*pre_flush;
@@ -1475,7 +1459,7 @@ radv_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_imag
  */
 static void
 emit_clear(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_att, const VkClearRect *clear_rect,
-           enum radv_cmd_flush_bits *pre_flush, enum radv_cmd_flush_bits *post_flush, uint32_t view_mask)
+           enum ac_barrier_flags *pre_flush, enum ac_barrier_flags *post_flush, uint32_t view_mask)
 {
    const struct radv_rendering_state *render = &cmd_buffer->state.render;
    VkImageAspectFlags aspects = clear_att->aspectMask;
@@ -1501,6 +1485,11 @@ emit_clear(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_at
       if (ds_att->format == VK_FORMAT_UNDEFINED)
          return;
 
+      /* Ignore aspects that have no effects. */
+      aspects &= render->ds_att_aspects;
+      if (!aspects)
+         return;
+
       VkClearDepthStencilValue clear_value = clear_att->clearValue.depthStencil;
 
       assert(aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
@@ -1520,10 +1509,10 @@ emit_clear(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_at
       }
 
       if (can_fast_clear_depth && can_fast_clear_stencil) {
-         radv_fast_clear_depth(cmd_buffer, ds_att->iview, clear_att->clearValue.depthStencil, clear_att->aspectMask,
+         radv_fast_clear_depth(cmd_buffer, ds_att->iview, clear_att->clearValue.depthStencil, aspects,
                                pre_flush, post_flush);
       } else if (!can_fast_clear_depth && !can_fast_clear_stencil) {
-         emit_depthstencil_clear(cmd_buffer, clear_att->clearValue.depthStencil, clear_att->aspectMask, clear_rect,
+         emit_depthstencil_clear(cmd_buffer, clear_att->clearValue.depthStencil, aspects, clear_rect,
                                  view_mask);
       } else {
          if (can_fast_clear_depth) {
@@ -1567,7 +1556,7 @@ radv_rendering_needs_clear(const VkRenderingInfo *pRenderingInfo)
 
 static void
 radv_subpass_clear_attachment(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_att,
-                              enum radv_cmd_flush_bits *pre_flush, enum radv_cmd_flush_bits *post_flush)
+                              enum ac_barrier_flags *pre_flush, enum ac_barrier_flags *post_flush)
 {
    const struct radv_rendering_state *render = &cmd_buffer->state.render;
 
@@ -1593,8 +1582,8 @@ void
 radv_cmd_buffer_clear_rendering(struct radv_cmd_buffer *cmd_buffer, const VkRenderingInfo *pRenderingInfo)
 {
    const struct radv_rendering_state *render = &cmd_buffer->state.render;
-   enum radv_cmd_flush_bits pre_flush = 0;
-   enum radv_cmd_flush_bits post_flush = 0;
+   enum ac_barrier_flags pre_flush = 0;
+   enum ac_barrier_flags post_flush = 0;
 
    if (!radv_rendering_needs_clear(pRenderingInfo))
       return;
@@ -1925,8 +1914,8 @@ radv_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount
                          uint32_t rectCount, const VkClearRect *pRects)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
-   enum radv_cmd_flush_bits pre_flush = 0;
-   enum radv_cmd_flush_bits post_flush = 0;
+   enum ac_barrier_flags pre_flush = 0;
+   enum ac_barrier_flags post_flush = 0;
 
    radv_meta_begin_rendering(cmd_buffer);
 

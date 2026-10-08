@@ -566,6 +566,8 @@ tc_batch_flush(struct threaded_context *tc, bool full_copy)
 
    tc_batch_check(next);
    tc_debug_check(tc);
+   /* can't set merge flag in queued batch without racing */
+   tc->pending_vbs = NULL;
    tc->bytes_mapped_estimate = 0;
    tc->bytes_replaced_estimate = 0;
    p_atomic_add(&tc->num_offloaded_slots, next->num_total_slots);
@@ -613,6 +615,12 @@ tc_add_sized_call(struct threaded_context *tc, enum tc_call_id id,
       next = &tc->batch_slots[tc->next];
       tc_assert(next->num_total_slots == 0);
       tc_assert(next->last_mergeable_call == NULL);
+   }
+
+   /* the calls between may cause drivers to save/restore/??? vbs: don't merge */
+   if (id >= TC_CALL_flush_resource && id <= TC_CALL_clear_texture) {
+      tc->pending_vbs = NULL;
+      tc->pending_vbs_seen_draws = false;
    }
 
    tc_assert(util_queue_fence_is_signalled(&next->fence));
@@ -771,6 +779,8 @@ _tc_sync(struct threaded_context *tc, UNUSED const char *info, UNUSED const char
    }
 
    tc_debug_check(tc);
+   tc->pending_vbs = NULL;
+   tc->pending_vbs_seen_draws = false;
 
    if (tc->options.parse_renderpass_info) {
       int renderpass_info_idx = next->renderpass_info_idx;
@@ -885,31 +895,31 @@ tc_add_shader_bindings_to_buffer_list(struct threaded_context *tc,
 
 static unsigned
 tc_rebind_shader_bindings(struct threaded_context *tc, uint32_t old_id,
-                          uint32_t new_id, mesa_shader_stage shader, uint32_t *rebind_mask)
+                          uint32_t new_id, mesa_shader_stage shader, uint64_t *rebind_mask)
 {
    unsigned ubo = 0, ssbo = 0, img = 0, sampler = 0;
 
    ubo = tc_rebind_bindings(old_id, new_id, tc->const_buffers[shader],
                             tc->max_const_buffers);
    if (ubo)
-      *rebind_mask |= BITFIELD_BIT(TC_BINDING_UBO_VS) << shader;
+      *rebind_mask |= BITFIELD64_BIT(TC_BINDING_UBO_VS) << shader;
    if (tc->seen_shader_buffers[shader]) {
       ssbo = tc_rebind_bindings(old_id, new_id, tc->shader_buffers[shader],
                                 tc->max_shader_buffers);
       if (ssbo)
-         *rebind_mask |= BITFIELD_BIT(TC_BINDING_SSBO_VS) << shader;
+         *rebind_mask |= BITFIELD64_BIT(TC_BINDING_SSBO_VS) << shader;
    }
    if (tc->seen_image_buffers[shader]) {
       img = tc_rebind_bindings(old_id, new_id, tc->image_buffers[shader],
                                tc->max_images);
       if (img)
-         *rebind_mask |= BITFIELD_BIT(TC_BINDING_IMAGE_VS) << shader;
+         *rebind_mask |= BITFIELD64_BIT(TC_BINDING_IMAGE_VS) << shader;
    }
    if (tc->seen_sampler_buffers[shader]) {
       sampler = tc_rebind_bindings(old_id, new_id, tc->sampler_buffers[shader],
                                    tc->max_samplers);
       if (sampler)
-         *rebind_mask |= BITFIELD_BIT(TC_BINDING_SAMPLERVIEW_VS) << shader;
+         *rebind_mask |= BITFIELD64_BIT(TC_BINDING_SAMPLERVIEW_VS) << shader;
    }
    return ubo + ssbo + img + sampler;
 }
@@ -972,20 +982,20 @@ tc_add_all_mesh_bindings_to_buffer_list(struct threaded_context *tc)
 }
 
 static unsigned
-tc_rebind_buffer(struct threaded_context *tc, uint32_t old_id, uint32_t new_id, uint32_t *rebind_mask)
+tc_rebind_buffer(struct threaded_context *tc, uint32_t old_id, uint32_t new_id, uint64_t *rebind_mask)
 {
    unsigned vbo = 0, so = 0;
 
    vbo = tc_rebind_bindings(old_id, new_id, tc->vertex_buffers,
                             tc->num_vertex_buffers);
    if (vbo)
-      *rebind_mask |= BITFIELD_BIT(TC_BINDING_VERTEX_BUFFER);
+      *rebind_mask |= BITFIELD64_BIT(TC_BINDING_VERTEX_BUFFER);
 
    if (tc->seen_streamout_buffers) {
       so = tc_rebind_bindings(old_id, new_id, tc->streamout_buffers,
                               PIPE_MAX_SO_BUFFERS);
       if (so)
-         *rebind_mask |= BITFIELD_BIT(TC_BINDING_STREAMOUT_BUFFER);
+         *rebind_mask |= BITFIELD64_BIT(TC_BINDING_STREAMOUT_BUFFER);
    }
    unsigned rebound = vbo + so;
 
@@ -1000,6 +1010,8 @@ tc_rebind_buffer(struct threaded_context *tc, uint32_t old_id, uint32_t new_id, 
       rebound += tc_rebind_shader_bindings(tc, old_id, new_id, MESA_SHADER_GEOMETRY, rebind_mask);
 
    rebound += tc_rebind_shader_bindings(tc, old_id, new_id, MESA_SHADER_COMPUTE, rebind_mask);
+   rebound += tc_rebind_shader_bindings(tc, old_id, new_id, MESA_SHADER_TASK, rebind_mask);
+   rebound += tc_rebind_shader_bindings(tc, old_id, new_id, MESA_SHADER_MESH, rebind_mask);
 
    if (rebound)
       BITSET_SET(tc->buffer_lists[tc->next_buf_list].buffer_list, new_id & TC_BUFFER_ID_MASK);
@@ -1157,7 +1169,7 @@ threaded_context_unwrap_sync(struct pipe_context *pipe)
    }; \
    \
    static uint16_t ALWAYS_INLINE \
-   tc_call_##func(struct pipe_context *pipe, void *call) \
+   tc_call_##func(struct pipe_context *pipe, void *call, struct tc_batch *batch) \
    { \
       pipe->func(pipe, addr(to_call(call, tc_call_##func)->state)); \
       return call_size(tc_call_##func); \
@@ -1219,7 +1231,7 @@ struct tc_query_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_destroy_query(struct pipe_context *pipe, void *call)
+tc_call_destroy_query(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct pipe_query *query = to_call(call, tc_query_call)->query;
    struct threaded_query *tq = threaded_query(query);
@@ -1240,7 +1252,7 @@ tc_destroy_query(struct pipe_context *_pipe, struct pipe_query *query)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_begin_query(struct pipe_context *pipe, void *call)
+tc_call_begin_query(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    pipe->begin_query(pipe, to_call(call, tc_query_call)->query);
    return call_size(tc_query_call);
@@ -1263,7 +1275,7 @@ struct tc_end_query_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_end_query(struct pipe_context *pipe, void *call)
+tc_call_end_query(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_end_query_call *p = to_call(call, tc_end_query_call);
    struct threaded_query *tq = threaded_query(p->query);
@@ -1334,7 +1346,7 @@ struct tc_query_result_resource {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_get_query_result_resource(struct pipe_context *pipe, void *call)
+tc_call_get_query_result_resource(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_query_result_resource *p = to_call(call, tc_query_result_resource);
 
@@ -1374,7 +1386,7 @@ struct tc_render_condition {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_render_condition(struct pipe_context *pipe, void *call)
+tc_call_render_condition(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_render_condition *p = to_call(call, tc_render_condition);
    pipe->render_condition(pipe, p->query, p->condition, p->mode);
@@ -1395,6 +1407,14 @@ tc_render_condition(struct pipe_context *_pipe,
    p->mode = mode;
 }
 
+ALWAYS_INLINE static void
+tc_update_pending_vbs(struct threaded_context *tc, void *pending_vbs)
+{
+   if (tc->pending_vbs && tc->pending_vbs_seen_draws)
+      tc->pending_vbs->merge_with_draw = true;
+   tc->pending_vbs = pending_vbs;
+   tc->pending_vbs_seen_draws = false;
+}
 
 /********************************************************************
  * constant (immutable) states
@@ -1454,7 +1474,8 @@ TC_CSO_SHADER_TRACK(tcs)
 TC_CSO_SHADER_TRACK(tes)
 TC_CSO_CREATE(sampler, sampler)
 TC_CSO_DELETE(sampler)
-TC_CSO_BIND(vertex_elements)
+TC_CSO_BIND(vertex_elements,
+   tc_update_pending_vbs(tc, NULL);)
 TC_CSO_DELETE(vertex_elements)
 TC_CSO_SHADER(ms)
 TC_CSO_SHADER_TRACK(ts);
@@ -1475,7 +1496,7 @@ struct tc_sampler_states {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_bind_sampler_states(struct pipe_context *pipe, void *call)
+tc_call_bind_sampler_states(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_sampler_states *p = (struct tc_sampler_states *)call;
 
@@ -1517,7 +1538,7 @@ struct tc_framebuffer {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_framebuffer_state(struct pipe_context *pipe, void *call)
+tc_call_set_framebuffer_state(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct pipe_framebuffer_state *p = &to_call(call, tc_framebuffer)->state;
 
@@ -1620,7 +1641,7 @@ struct tc_sample_coverage {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_sample_coverage(struct pipe_context *pipe, void *call)
+tc_call_set_sample_coverage(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_sample_coverage *p = to_call(call, tc_sample_coverage);
 
@@ -1645,7 +1666,7 @@ struct tc_tess_state {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_tess_state(struct pipe_context *pipe, void *call)
+tc_call_set_tess_state(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    float *p = to_call(call, tc_tess_state)->state;
 
@@ -1671,7 +1692,7 @@ struct tc_patch_vertices {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_patch_vertices(struct pipe_context *pipe, void *call)
+tc_call_set_patch_vertices(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    uint8_t patch_vertices = to_call(call, tc_patch_vertices)->patch_vertices;
 
@@ -1700,7 +1721,7 @@ struct tc_constant_buffer {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_constant_buffer(struct pipe_context *pipe, void *call)
+tc_call_set_constant_buffer(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_constant_buffer *p = (struct tc_constant_buffer *)call;
 
@@ -1765,7 +1786,7 @@ struct tc_inlinable_constants {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_inlinable_constants(struct pipe_context *pipe, void *call)
+tc_call_set_inlinable_constants(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_inlinable_constants *p = to_call(call, tc_inlinable_constants);
 
@@ -1794,7 +1815,7 @@ struct tc_sample_locations {
 
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_sample_locations(struct pipe_context *pipe, void *call)
+tc_call_set_sample_locations(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_sample_locations *p = (struct tc_sample_locations *)call;
 
@@ -1821,7 +1842,7 @@ struct tc_scissors {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_scissor_states(struct pipe_context *pipe, void *call)
+tc_call_set_scissor_states(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_scissors *p = (struct tc_scissors *)call;
 
@@ -1850,7 +1871,7 @@ struct tc_viewports {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_viewport_states(struct pipe_context *pipe, void *call)
+tc_call_set_viewport_states(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_viewports *p = (struct tc_viewports *)call;
 
@@ -1883,7 +1904,7 @@ struct tc_window_rects {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_window_rectangles(struct pipe_context *pipe, void *call)
+tc_call_set_window_rectangles(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_window_rects *p = (struct tc_window_rects *)call;
 
@@ -1912,7 +1933,7 @@ struct tc_sampler_views {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_sampler_views(struct pipe_context *pipe, void *call)
+tc_call_set_sampler_views(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_sampler_views *p = (struct tc_sampler_views *)call;
 
@@ -1977,7 +1998,7 @@ struct tc_sampler_view_release {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_sampler_view_release(struct pipe_context *pipe, void *call)
+tc_call_sampler_view_release(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_sampler_view_release *p = (struct tc_sampler_view_release *)call;
 
@@ -2004,7 +2025,7 @@ struct tc_resource_release {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_resource_release(struct pipe_context *pipe, void *call)
+tc_call_resource_release(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_resource_release *p = (struct tc_resource_release *)call;
 
@@ -2033,7 +2054,7 @@ struct tc_shader_images {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_shader_images(struct pipe_context *pipe, void *call)
+tc_call_set_shader_images(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_shader_images *p = (struct tc_shader_images *)call;
    unsigned count = p->count;
@@ -2129,7 +2150,7 @@ struct tc_shader_buffers {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_shader_buffers(struct pipe_context *pipe, void *call)
+tc_call_set_shader_buffers(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_shader_buffers *p = (struct tc_shader_buffers *)call;
 
@@ -2199,7 +2220,7 @@ tc_set_shader_buffers(struct pipe_context *_pipe,
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_vertex_buffers(struct pipe_context *pipe, void *call)
+tc_call_set_vertex_buffers(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_vertex_buffers *p = (struct tc_vertex_buffers *)call;
    unsigned count = p->count;
@@ -2207,7 +2228,10 @@ tc_call_set_vertex_buffers(struct pipe_context *pipe, void *call)
    for (unsigned i = 0; i < count; i++)
       tc_assert(!p->slot[i].is_user_buffer);
 
-   pipe->set_vertex_buffers(pipe, count, p->slot);
+   if (p->merge_with_draw)
+      batch->tc->deferred_vbs = p;
+   else
+      pipe->set_vertex_buffers(pipe, count, p->slot);
    return p->base.num_slots;
 }
 
@@ -2219,11 +2243,11 @@ tc_set_vertex_buffers(struct pipe_context *_pipe, unsigned count,
 
    assert(!count || buffers);
 
+   struct tc_vertex_buffers *p =
+      tc_add_slot_based_call(tc, TC_CALL_set_vertex_buffers, tc_vertex_buffers, count);
+   p->merge_with_draw = false;
+   p->count = count;
    if (count) {
-      struct tc_vertex_buffers *p =
-         tc_add_slot_based_call(tc, TC_CALL_set_vertex_buffers, tc_vertex_buffers, count);
-      p->count = count;
-
       struct tc_buffer_list *next = &tc->buffer_lists[tc->next_buf_list];
 
       memcpy(p->slot, buffers, count * sizeof(struct pipe_vertex_buffer));
@@ -2237,11 +2261,8 @@ tc_set_vertex_buffers(struct pipe_context *_pipe, unsigned count,
             tc_unbind_buffer(&tc->vertex_buffers[i]);
          }
       }
-   } else {
-      struct tc_vertex_buffers *p =
-         tc_add_slot_based_call(tc, TC_CALL_set_vertex_buffers, tc_vertex_buffers, 0);
-      p->count = 0;
    }
+   tc_update_pending_vbs(tc, p);
 
    /* We don't need to unbind trailing buffers because we never touch bindings
     * after num_vertex_buffers.
@@ -2259,9 +2280,14 @@ tc_add_set_vertex_buffers_call(struct pipe_context *_pipe, unsigned count)
     */
    tc->num_vertex_buffers = count;
 
+
    struct tc_vertex_buffers *p =
       tc_add_slot_based_call(tc, TC_CALL_set_vertex_buffers, tc_vertex_buffers, count);
+   p->merge_with_draw = false;
    p->count = count;
+
+   tc_update_pending_vbs(tc, p);
+
    return p->slot;
 }
 
@@ -2273,7 +2299,7 @@ struct tc_vertex_elements_and_buffers {
 };
 
 static uint16_t
-tc_call_set_vertex_elements_and_buffers(struct pipe_context *pipe, void *call)
+tc_call_set_vertex_elements_and_buffers(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_vertex_elements_and_buffers *p =
       (struct tc_vertex_elements_and_buffers *)call;
@@ -2302,6 +2328,8 @@ tc_add_set_vertex_elements_and_buffers_call(struct pipe_context *_pipe,
 {
    struct threaded_context *tc = threaded_context(_pipe);
    unsigned extra_slots = 0;
+
+   tc_update_pending_vbs(tc, NULL);
 
    /* We don't need to unbind trailing buffers because we never touch bindings
     * after num_vertex_buffers.
@@ -2342,7 +2370,7 @@ struct tc_stream_outputs {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_stream_output_targets(struct pipe_context *pipe, void *call)
+tc_call_set_stream_output_targets(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_stream_outputs *p = to_call(call, tc_stream_outputs);
    unsigned count = p->count;
@@ -2479,7 +2507,7 @@ struct tc_make_texture_handle_resident {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_make_texture_handle_resident(struct pipe_context *pipe, void *call)
+tc_call_make_texture_handle_resident(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_make_texture_handle_resident *p =
       to_call(call, tc_make_texture_handle_resident);
@@ -2533,7 +2561,7 @@ struct tc_make_image_handle_resident {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_make_image_handle_resident(struct pipe_context *pipe, void *call)
+tc_call_make_image_handle_resident(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_make_image_handle_resident *p =
       to_call(call, tc_make_image_handle_resident);
@@ -2568,7 +2596,7 @@ tc_flush(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
 struct tc_replace_buffer_storage {
    struct tc_call_base base;
    uint16_t num_rebinds;
-   uint32_t rebind_mask;
+   uint64_t rebind_mask;
    uint32_t delete_buffer_id;
    struct pipe_resource *dst;
    struct pipe_resource *src;
@@ -2576,7 +2604,7 @@ struct tc_replace_buffer_storage {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_replace_buffer_storage(struct pipe_context *pipe, void *call)
+tc_call_replace_buffer_storage(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_replace_buffer_storage *p = to_call(call, tc_replace_buffer_storage);
 
@@ -2930,7 +2958,7 @@ struct tc_transfer_flush_region {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_transfer_flush_region(struct pipe_context *pipe, void *call)
+tc_call_transfer_flush_region(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_transfer_flush_region *p = to_call(call, tc_transfer_flush_region);
 
@@ -3020,7 +3048,7 @@ tc_transfer_flush_region(struct pipe_context *_pipe,
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_buffer_unmap(struct pipe_context *pipe, void *call)
+tc_call_buffer_unmap(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_buffer_unmap *p = to_call(call, tc_buffer_unmap);
 
@@ -3131,7 +3159,7 @@ struct tc_texture_unmap {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_texture_unmap(struct pipe_context *pipe, void *call)
+tc_call_texture_unmap(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_texture_unmap *p = (struct tc_texture_unmap *) call;
 
@@ -3169,7 +3197,7 @@ struct tc_buffer_subdata {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_buffer_subdata(struct pipe_context *pipe, void *call)
+tc_call_buffer_subdata(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_buffer_subdata *p = (struct tc_buffer_subdata *)call;
 
@@ -3294,7 +3322,7 @@ struct tc_texture_subdata {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_texture_subdata(struct pipe_context *pipe, void *call)
+tc_call_texture_subdata(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_texture_subdata *p = (struct tc_texture_subdata *)call;
 
@@ -3435,7 +3463,7 @@ struct tc_string_marker {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_emit_string_marker(struct pipe_context *pipe, void *call)
+tc_call_emit_string_marker(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_string_marker *p = (struct tc_string_marker *)call;
    pipe->emit_string_marker(pipe, p->slot, p->len);
@@ -3525,7 +3553,7 @@ struct tc_fence_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_fence_server_sync(struct pipe_context *pipe, void *call)
+tc_call_fence_server_sync(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_fence_call *p = (void*)to_call(call, tc_fence_call);
    struct pipe_fence_handle *fence = p->fence;
@@ -3586,7 +3614,7 @@ struct tc_context_param {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_set_context_param(struct pipe_context *pipe, void *call)
+tc_call_set_context_param(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_context_param *p = to_call(call, tc_context_param);
 
@@ -3660,7 +3688,7 @@ tc_flush_queries(struct threaded_context *tc)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_flush_deferred(struct pipe_context *pipe, void *call)
+tc_call_flush_deferred(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_flush_deferred_call *p = to_call(call, tc_flush_deferred_call);
    struct pipe_screen *screen = pipe->screen;
@@ -3672,7 +3700,7 @@ tc_call_flush_deferred(struct pipe_context *pipe, void *call)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_flush(struct pipe_context *pipe, void *call)
+tc_call_flush(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_flush_call *p = to_call(call, tc_flush_call);
    struct pipe_screen *screen = pipe->screen;
@@ -3758,13 +3786,32 @@ out_of_memory:
    tc->flushing = false;
 }
 
+ALWAYS_INLINE static void
+inline_vbs(struct pipe_context *pipe, struct tc_batch *batch,
+           struct pipe_draw_info *info,
+           struct pipe_draw_start_count_bias *multi, unsigned num_draws)
+{
+   if (batch->tc->deferred_vbs) {
+      /* at this point, it has been determined that the call sequence is like:
+       * - draw
+       * - set_vbs
+       * - ...
+       * - draw <-- we are here
+       */
+      pipe->draw_vbo_buffers(pipe, info, batch->tc->deferred_vbs->slot, batch->tc->deferred_vbs->count,  multi, num_draws);
+      batch->tc->deferred_vbs = NULL;
+   } else {
+      pipe->draw_vbo(pipe, info, 0, NULL, multi, num_draws);
+   }
+}
+
 struct tc_draw_single_drawid {
    struct tc_draw_single base;
    unsigned drawid_offset;
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_single_drawid(struct pipe_context *pipe, void *call)
+tc_call_draw_single_drawid(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_draw_single_drawid *info_drawid = to_call(call, tc_draw_single_drawid);
    struct tc_draw_single *info = &info_drawid->base;
@@ -3779,6 +3826,11 @@ tc_call_draw_single_drawid(struct pipe_context *pipe, void *call)
 
    info->info.index_bounds_valid = false;
    info->info.has_user_indices = false;
+
+   if (batch->tc->deferred_vbs) {
+      pipe->set_vertex_buffers(pipe, batch->tc->deferred_vbs->count, batch->tc->deferred_vbs->slot);
+      batch->tc->deferred_vbs = NULL;
+   }
 
    pipe->draw_vbo(pipe, &info->info, info_drawid->drawid_offset, NULL, &draw, 1);
 
@@ -3828,7 +3880,7 @@ is_next_call_a_mergeable_draw(struct tc_draw_single *first,
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_single(struct pipe_context *pipe, void *call)
+tc_call_draw_single(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    /* Draw call merging. */
    struct tc_draw_single *first = to_call(call, tc_draw_single);
@@ -3862,7 +3914,7 @@ tc_call_draw_single(struct pipe_context *pipe, void *call)
          }
 
          first->info.index_bias_varies = index_bias_varies;
-         pipe->draw_vbo(pipe, &first->info, 0, NULL, multi, num_draws);
+         inline_vbs(pipe, batch, &first->info, multi, num_draws);
 
          return call_size(tc_draw_single) * num_draws;
       }
@@ -3879,7 +3931,7 @@ tc_call_draw_single(struct pipe_context *pipe, void *call)
    first->info.index_bounds_valid = false;
    first->info.has_user_indices = false;
 
-   pipe->draw_vbo(pipe, &first->info, 0, NULL, &draw, 1);
+   inline_vbs(pipe, batch, &first->info, &draw, 1);
 
    return call_size(tc_draw_single);
 }
@@ -3892,12 +3944,16 @@ struct tc_draw_indirect {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_indirect(struct pipe_context *pipe, void *call)
+tc_call_draw_indirect(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_draw_indirect *info = to_call(call, tc_draw_indirect);
 
    info->info.index_bounds_valid = false;
 
+   if (batch->tc->deferred_vbs) {
+      pipe->set_vertex_buffers(pipe, batch->tc->deferred_vbs->count, batch->tc->deferred_vbs->slot);
+      batch->tc->deferred_vbs = NULL;
+   }
    pipe->draw_vbo(pipe, &info->info, 0, &info->indirect, &info->draw, 1);
 
    tc_drop_so_target_reference(info->indirect.count_from_stream_output);
@@ -3912,14 +3968,14 @@ struct tc_draw_multi {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_multi(struct pipe_context *pipe, void *call)
+tc_call_draw_multi(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_draw_multi *info = (struct tc_draw_multi*)call;
 
    info->info.has_user_indices = false;
    info->info.index_bounds_valid = false;
 
-   pipe->draw_vbo(pipe, &info->info, 0, NULL, info->slot, info->num_draws);
+   inline_vbs(pipe, batch, &info->info, info->slot, info->num_draws);
 
    return info->base.num_slots;
 }
@@ -4260,6 +4316,8 @@ tc_draw_vbo(struct pipe_context *_pipe, const struct pipe_draw_info *info,
    struct threaded_context *tc = threaded_context(_pipe);
    if (tc->options.parse_renderpass_info)
       tc_parse_draw(tc);
+   
+   tc->pending_vbs_seen_draws = true;
 
    /* Use a function table to call the desired variant of draw_vbo. */
    unsigned index = (indirect != NULL) * 8 +
@@ -4283,6 +4341,8 @@ tc_add_draw_single_call(struct pipe_context *_pipe,
 
    struct tc_draw_single *p =
       tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+
+   tc->pending_vbs_seen_draws = true;
 
    if (index_bo)
       tc_add_to_buffer_list(&tc->buffer_lists[tc->next_buf_list], index_bo);
@@ -4320,7 +4380,7 @@ is_next_call_a_mergeable_draw_vstate(struct tc_draw_vstate_single *first,
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_vstate_single(struct pipe_context *pipe, void *call)
+tc_call_draw_vstate_single(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    /* Draw call merging. */
    struct tc_draw_vstate_single *first = to_call(call, tc_draw_vstate_single);
@@ -4367,7 +4427,7 @@ struct tc_draw_vstate_multi {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_vstate_multi(struct pipe_context *pipe, void *call)
+tc_call_draw_vstate_multi(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_draw_vstate_multi *info = (struct tc_draw_vstate_multi*)call;
 
@@ -4466,7 +4526,7 @@ struct tc_launch_grid_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_launch_grid(struct pipe_context *pipe, void *call)
+tc_call_launch_grid(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct pipe_grid_info *p = &to_call(call, tc_launch_grid_call)->info;
 
@@ -4504,7 +4564,7 @@ struct tc_image_copy_buffer {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_image_copy_buffer(struct pipe_context *pipe, void *call)
+tc_call_image_copy_buffer(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_image_copy_buffer *p = to_call(call, tc_image_copy_buffer);
 
@@ -4560,7 +4620,7 @@ tc_image_copy_buffer(struct pipe_context *_pipe,
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_resource_copy_region(struct pipe_context *pipe, void *call)
+tc_call_resource_copy_region(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_resource_copy_region *p = to_call(call, tc_resource_copy_region);
 
@@ -4620,7 +4680,7 @@ struct tc_blit_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_blit(struct pipe_context *pipe, void *call)
+tc_call_blit(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct pipe_blit_info *blit = &to_call(call, tc_blit_call)->info;
 
@@ -4631,9 +4691,9 @@ tc_call_blit(struct pipe_context *pipe, void *call)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_resolve(struct pipe_context *pipe, void *call)
+tc_call_resolve(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
-   return tc_call_blit(pipe, call);
+   return tc_call_blit(pipe, call, batch);
 }
 
 static struct tc_blit_call *
@@ -4748,7 +4808,7 @@ struct tc_generate_mipmap {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_generate_mipmap(struct pipe_context *pipe, void *call)
+tc_call_generate_mipmap(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_generate_mipmap *p = to_call(call, tc_generate_mipmap);
    ASSERTED bool result = pipe->generate_mipmap(pipe, p->res, p->format,
@@ -4804,7 +4864,7 @@ struct tc_resource_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_flush_resource(struct pipe_context *pipe, void *call)
+tc_call_flush_resource(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct pipe_resource *resource = to_call(call, tc_resource_call)->resource;
 
@@ -4825,7 +4885,7 @@ tc_flush_resource(struct pipe_context *_pipe, struct pipe_resource *resource)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_invalidate_resource(struct pipe_context *pipe, void *call)
+tc_call_invalidate_resource(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct pipe_resource *resource = to_call(call, tc_resource_call)->resource;
 
@@ -4879,7 +4939,7 @@ struct tc_clear {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_clear(struct pipe_context *pipe, void *call)
+tc_call_clear(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_clear *p = to_call(call, tc_clear);
 
@@ -4949,7 +5009,7 @@ struct tc_clear_render_target {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_clear_render_target(struct pipe_context *pipe, void *call)
+tc_call_clear_render_target(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_clear_render_target *p = to_call(call, tc_clear_render_target);
 
@@ -4996,7 +5056,7 @@ struct tc_clear_depth_stencil {
 
 
 static uint16_t ALWAYS_INLINE
-tc_call_clear_depth_stencil(struct pipe_context *pipe, void *call)
+tc_call_clear_depth_stencil(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_clear_depth_stencil *p = to_call(call, tc_clear_depth_stencil);
 
@@ -5039,7 +5099,7 @@ struct tc_clear_buffer {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_clear_buffer(struct pipe_context *pipe, void *call)
+tc_call_clear_buffer(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_clear_buffer *p = to_call(call, tc_clear_buffer);
 
@@ -5079,7 +5139,7 @@ struct tc_clear_texture {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_clear_texture(struct pipe_context *pipe, void *call)
+tc_call_clear_texture(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_clear_texture *p = to_call(call, tc_clear_texture);
 
@@ -5113,7 +5173,7 @@ struct tc_resource_commit {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_resource_commit(struct pipe_context *pipe, void *call)
+tc_call_resource_commit(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_resource_commit *p = to_call(call, tc_resource_commit);
 
@@ -5192,7 +5252,7 @@ tc_new_intel_perf_query_obj(struct pipe_context *_pipe, unsigned query_index)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_begin_intel_perf_query(struct pipe_context *pipe, void *call)
+tc_call_begin_intel_perf_query(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    (void)pipe->begin_intel_perf_query(pipe, to_call(call, tc_query_call)->query);
    return call_size(tc_query_call);
@@ -5210,7 +5270,7 @@ tc_begin_intel_perf_query(struct pipe_context *_pipe, struct pipe_query *q)
 }
 
 static uint16_t ALWAYS_INLINE
-tc_call_end_intel_perf_query(struct pipe_context *pipe, void *call)
+tc_call_end_intel_perf_query(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    pipe->end_intel_perf_query(pipe, to_call(call, tc_query_call)->query);
    return call_size(tc_query_call);
@@ -5274,7 +5334,7 @@ struct tc_draw_mesh_tasks {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_draw_mesh_tasks(struct pipe_context *pipe, void *call)
+tc_call_draw_mesh_tasks(struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_draw_mesh_tasks *p = to_call(call, tc_draw_mesh_tasks);
 
@@ -5314,7 +5374,7 @@ struct tc_callback_call {
 };
 
 static uint16_t ALWAYS_INLINE
-tc_call_callback(UNUSED struct pipe_context *pipe, void *call)
+tc_call_callback(UNUSED struct pipe_context *pipe, void *call, struct tc_batch *batch)
 {
    struct tc_callback_call *p = to_call(call, tc_callback_call);
 
@@ -5369,7 +5429,7 @@ batch_execute(struct tc_batch *batch, struct pipe_context *pipe, bool parsing)
       switch (call->call_id) {
 #define CALL(name) \
       case TC_CALL_##name: \
-         iter += tc_call_##name(pipe, call); \
+         iter += tc_call_##name(pipe, call, batch); \
          break;
 #include "u_threaded_context_calls.h"
 #undef CALL
@@ -5519,7 +5579,7 @@ tc_destroy(struct pipe_context *_pipe)
       pipe_resource_reference(&tc->fb_resources[i], NULL);
    pipe_resource_reference(&tc->fb_resolve, NULL);
 
-   FREE(tc);
+   FREE_CL(tc);
 }
 
 void tc_driver_internal_flush_notify(struct threaded_context *tc)
@@ -5569,7 +5629,7 @@ threaded_context_create(struct pipe_context *pipe,
    if (!debug_get_bool_option("GALLIUM_THREAD", true))
       return pipe;
 
-   tc = CALLOC_STRUCT(threaded_context);
+   tc = CALLOC_STRUCT_CL(threaded_context);
    if (!tc) {
       pipe->destroy(pipe);
       return NULL;

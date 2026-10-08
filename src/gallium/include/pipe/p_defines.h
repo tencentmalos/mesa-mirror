@@ -1035,7 +1035,6 @@ struct pipe_caps {
    bool viewport_mask;
    bool alpha_to_coverage_dither_control;
    bool map_unsynchronized_thread_safe;
-   bool blend_equation_advanced;
    bool nir_atomics_as_deref;
    bool no_clip_on_copy_tex;
    bool shader_atomic_int64;
@@ -1074,6 +1073,7 @@ struct pipe_caps {
    bool prefer_persp;
    bool blit_3d;
    bool glsl_bindless_handles_are_32bit;
+   bool polygon_stipple;
 
    int accelerated;
    int min_texel_offset;
@@ -1124,6 +1124,7 @@ struct pipe_caps {
    unsigned rasterizer_subpixel_bits;
    unsigned mixed_color_depth_bits;
    unsigned fbfetch;
+   unsigned blend_equation_advanced;
    unsigned sparse_buffer_page_size;
    unsigned max_combined_shader_output_resources;
    unsigned framebuffer_msaa_constraints;
@@ -1235,6 +1236,26 @@ enum pipe_context_param
     * benefits from it.
     */
    PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+
+   /* The minification/magnification switch-over point, the constant c of the
+    * GL and ES specs. Value 1 selects c = 0.5, value 0 selects c = 0.
+    *
+    * ES 2.0 section 3.7.8 requires the first: "If the magnification filter is
+    * given by LINEAR and the minification filter is given by
+    * NEAREST_MIPMAP_NEAREST or NEAREST_MIPMAP_LINEAR, then c = 0.5. This is
+    * done to ensure that a minified texture does not appear "sharper" than a
+    * magnified texture. Otherwise c = 0."
+    *
+    * GL 3.1 section 3.8.9 relaxed it to "Implementations may either
+    * unconditionally assume c = 0 [...] or may choose to make c depend on the
+    * combination of minification and magnification modes" (bug 4392), and
+    * GL 4.5 and ES 3.0 removed the choice again, c = 0 always (Bug 9997).
+    *
+    * So c = 0.5 is required up to GL 3.0 and in ES 2.0, and additionally
+    * allowed from GL 3.1 to 4.4. Only sent where it is required, so drivers
+    * default to c = 0.
+    */
+   PIPE_CONTEXT_PARAM_MAG_SWITCHOVER_HALF,
 };
 
 /**

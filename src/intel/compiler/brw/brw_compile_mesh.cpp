@@ -355,6 +355,7 @@ brw_compile_task(const struct brw_compiler *compiler,
          .nir = shader,
          .dispatch_width = dispatch_width,
          .compiler = compiler,
+         .key = &key->base,
          .archiver = params->base.archiver,
       };
 
@@ -362,7 +363,7 @@ brw_compile_task(const struct brw_compiler *compiler,
       brw_nir_apply_key(pt, &key->base, dispatch_width);
 
       brw_nir_opt_vectorize_urb(pt);
-      brw_nir_optimize(pt);
+      brw_nir_optimize(pt, true);
       /* brw_nir_optimize undoes late lowerings. */
       BRW_NIR_PASS(nir_opt_algebraic_late);
       brw_postprocess_nir_out_of_ssa(pt, debug_enabled);
@@ -1050,8 +1051,10 @@ brw_compile_mesh(const struct brw_compiler *compiler,
     * immediate offset limits, so re-run the lowering.
     */
    if (BRW_NIR_PASS(nir_opt_offsets, &offset_options) &&
-       brw_lsc_supports_base_offset(devinfo))
-      BRW_NIR_PASS(brw_nir_lower_immediate_offsets, pt->key->use_efficient_64bit);
+       brw_lsc_supports_base_offset(devinfo)) {
+      BRW_NIR_PASS(brw_nir_lower_immediate_offsets, devinfo,
+                   pt->key->use_efficient_64bit);
+   }
 
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
@@ -1077,6 +1080,7 @@ brw_compile_mesh(const struct brw_compiler *compiler,
          .nir = shader,
          .dispatch_width = dispatch_width,
          .compiler = compiler,
+         .key = &key->base,
          .archiver = params->base.archiver,
       };
 
@@ -1088,7 +1092,7 @@ brw_compile_mesh(const struct brw_compiler *compiler,
       /* Load uniforms can do a better job for constants, so fold before it. */
       BRW_NIR_PASS(nir_opt_constant_folding);
 
-      brw_nir_optimize(pt);
+      brw_nir_optimize(pt, true);
       /* brw_nir_optimize undoes late lowerings. */
       BRW_NIR_PASS(nir_opt_algebraic_late);
       brw_postprocess_nir_out_of_ssa(pt, debug_enabled);

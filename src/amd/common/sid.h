@@ -93,6 +93,7 @@
 #define   WAIT_REG_MEM_GREATER_OR_EQUAL               5
 #define   WAIT_REG_MEM_MEM_SPACE(x)                   (((unsigned)(x)&0x3) << 4)
 #define   WAIT_REG_MEM_PFP                            (1 << 8)
+#define   WAIT_REG_MEM_UNCACHED_VI_MEC                (1 << 10)
 #define PKT3_MEM_WRITE                             0x3D /* GFX6 only */
 #define PKT3_INDIRECT_BUFFER                       0x3F /* GFX6+ */
 #define PKT3_COPY_DATA                             0x40
@@ -185,7 +186,7 @@
 #define PKT3_DISPATCH_MESH_INDIRECT_MULTI          0x4C /* Indirect mesh shader only dispatch [GFX only], GFX10.3+ */
 #define   S_4C1_XYZ_DIM_REG(x)                        ((x & 0xFFFF))
 #define   S_4C1_DRAW_INDEX_REG(x)                     ((x & 0xFFFF) << 16)
-#define   S_4C2_DRAW_INDEX_ENABLE(x)                  ((x & 1) << 31)
+#define   S_4C2_DRAW_INDEX_ENABLE(x)                  (((unsigned)(x) & 1) << 31)
 #define   S_4C2_COUNT_INDIRECT_ENABLE(x)              ((x & 1) << 30)
 #define   S_4C2_THREAD_TRACE_MARKER_ENABLE(x)         ((x & 1) << 29)
 #define   S_4C2_XYZ_DIM_ENABLE(x)                     ((x & 1) << 28) /* GFX11+ */
@@ -193,7 +194,7 @@
 #define PKT3_DISPATCH_TASKMESH_GFX                 0x4D /* Task + mesh shader dispatch [GFX side], GFX10.3+ */
 #define   S_4D0_RING_ENTRY_REG(x)                     ((x & 0xFFFF) << 16)
 #define   S_4D0_XYZ_DIM_REG(x)                        ((x & 0xFFFF))
-#define   S_4D1_THREAD_TRACE_MARKER_ENABLE(x)         ((x & 1) << 31)
+#define   S_4D1_THREAD_TRACE_MARKER_ENABLE(x)         (((unsigned)(x) & 1) << 31)
 #define   S_4D1_XYZ_DIM_ENABLE(x)                     ((x & 1) << 30) /* GFX11+ */
 #define   S_4D1_MODE1_ENABLE(x)                       ((x & 1) << 29) /* GFX11+ */
 #define   S_4D1_LINEAR_DISPATCH_ENABLE(x)             ((x & 1) << 28) /* GFX11+ */
@@ -343,7 +344,7 @@
 #define SDMA_OPCODE_TRAP                           0x6
 #define SDMA_OPCODE_SEMAPHORE                      0x7
 #define SDMA_OPCODE_POLL_REGMEM                    0x8
-#define SDMA_POLL_MEM                              (1 << 31)
+#define SDMA_POLL_MEM                              (1u << 31)
 #define SDMA_POLL_INTERVAL_160_CLK                 0xa
 #define SDMA_POLL_RETRY_INDEFINITELY               0xfff
 #define SDMA_OPCODE_CONSTANT_FILL                  0xb
@@ -352,6 +353,20 @@
 #define SDMA_TS_SUB_OPCODE_GET_LOCAL_TIMESTAMP     0x1
 #define SDMA_TS_SUB_OPCODE_GET_GLOBAL_TIMESTAMP    0x2
 #define SDMA_OPCODE_SRBM_WRITE                     0xe
+
+/* SDMA 5.2-6.x cache policy: [1:0] = GL2 policy, [2] = LLC (MALL) no-alloc. */
+#define SDMA_5_2_CP_GL2_LRU                        0x0
+#define SDMA_5_2_CP_GL2_STREAM                     0x1
+#define SDMA_5_2_CP_GL2_NOA                        0x2
+#define SDMA_5_2_CP_GL2_BYPASS                     0x3
+#define SDMA_5_2_CP_LLC_ALLOC                      0x0
+#define SDMA_5_2_CP_LLC_NOALLOC                    0x4
+#define SDMA_5_2_COPY_TILED_SUB_WINDOW_CPV(x)      (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_COPY_TILED_SUB_WINDOW_TILED_CP(x) (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_COPY_TILED_SUB_WINDOW_LINEAR_CP(x) (((unsigned)(x) & 0x7) << 18)
+#define SDMA_5_2_COPY_T2T_SUB_WINDOW_CPV(x)        (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_COPY_T2T_SUB_WINDOW_SRC_CP(x)     (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_COPY_T2T_SUB_WINDOW_DST_CP(x)     (((unsigned)(x) & 0x7) << 18)
 
 /* There is apparently an undocumented HW limitation that
  * prevents the HW from copying the last 255 bytes of (1 << 22) - 1
@@ -371,7 +386,7 @@
 #define SDMA5_DCC_MAX_UCOM(x)          (((x) & 0x3) << 26) /* max uncompressed block size, 0: 64B, 1: 128B, 2: 256B */
 #define SDMA5_DCC_WRITE_COMPRESS(x)    (((x) & 0x1) << 28) /* DCC write compression enabled, dst must be tiled */
 #define SDMA5_DCC_TMZ(x)               (((x) & 0x1) << 29) /* metadata is TMZ */
-#define SDMA5_DCC_PIPE_ALIGNED(x)      (((x) & 0x1) << 31)
+#define SDMA5_DCC_PIPE_ALIGNED(x)      (((unsigned)(x) & 0x1) << 31)
 
 /* SDMA DCC settings for GFX12+ */
 #define SDMA7_DCC_DATA_FORMAT(x)       ((x) & 0x3f)

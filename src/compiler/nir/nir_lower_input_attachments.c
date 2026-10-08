@@ -25,33 +25,6 @@
 #include "nir_builder.h"
 
 static nir_def *
-load_frag_coord(nir_builder *b, nir_deref_instr *deref,
-                const nir_input_attachment_options *options)
-{
-   nir_def *frag_coord = nir_build_frag_coord(b, 2);
-
-   if (options->gmem_input_attachment_ir3 ||
-       options->gmem_depth_stencil_ir3) {
-      nir_variable *var = nir_deref_instr_get_variable(deref);
-      unsigned base = var->data.index;
-      nir_def *gmem_frag_coord = nir_trim_vector(b, nir_load_frag_coord_gmem_ir3(b), 2);
-
-      if (deref->deref_type == nir_deref_type_array &&
-          options->gmem_input_attachment_ir3) {
-         nir_def *gmem =
-            nir_i2b(b, nir_iand(b, nir_ishr(b, nir_imm_int(b, options->gmem_input_attachment_ir3 >> base), deref->arr.index.ssa),
-                                nir_imm_int(b, 1)));
-         frag_coord = nir_bcsel(b, gmem, gmem_frag_coord, frag_coord);
-      } else {
-         assert(deref->deref_type == nir_deref_type_var);
-         bool gmem = base == NIR_VARIABLE_NO_INDEX ? options->gmem_depth_stencil_ir3 : ((options->gmem_input_attachment_ir3 >> base) & 1);
-         frag_coord = gmem ? gmem_frag_coord : frag_coord;
-      }
-   }
-   return frag_coord;
-}
-
-static nir_def *
 load_layer_id(nir_builder *b, const nir_input_attachment_options *options)
 {
    if (options->use_view_id_for_layer)
@@ -66,18 +39,32 @@ load_coord(nir_builder *b, nir_deref_instr *deref,
 {
    if (options->use_ia_coord_intrin) {
       nir_def *index;
+      nir_variable *var;
       if (deref->deref_type == nir_deref_type_array) {
          ASSERTED nir_deref_instr *parent = nir_deref_instr_parent(deref);
          assert(parent->deref_type == nir_deref_type_var);
+         var = parent->var;
          index = deref->arr.index.ssa;
       } else {
          assert(deref->deref_type == nir_deref_type_var);
+         var = deref->var;
          index = nir_imm_int(b, 0);
       }
 
-      return nir_load_input_attachment_coord(b, index);
+      if (var->data.index == NIR_VARIABLE_NO_INDEX) {
+         /* Depth vs. stencil input attachment is determined by the sampler
+          * result type.
+          */
+         bool is_stencil =
+            glsl_base_type_is_integer(glsl_get_sampler_result_type(var->type));
+         return is_stencil ?
+            nir_load_stencil_input_attachment_coord(b) :
+            nir_load_depth_input_attachment_coord(b);
+      } else {
+         return nir_load_input_attachment_coord(b, index, .base = var->data.index);
+      }
    } else {
-      nir_def *pos = nir_f2i32(b, load_frag_coord(b, deref, options));
+      nir_def *pos = nir_f2i32(b, nir_build_frag_coord(b, 2));
       nir_def *layer = load_layer_id(b, options);
       return nir_vec3(b, nir_channel(b, pos, 0), nir_channel(b, pos, 1), layer);
    }

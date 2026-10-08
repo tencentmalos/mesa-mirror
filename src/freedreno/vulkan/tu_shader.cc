@@ -9,6 +9,7 @@
 
 #include "nir/nir_xfb_info.h"
 #include "spirv/nir_spirv.h"
+#include "util/blob.h"
 #include "util/macros.h"
 #include "util/mesa-blake3.h"
 #include "vk_nir.h"
@@ -549,7 +550,7 @@ can_speculate_descriptor_load(nir_src array_index,
 {
    return nir_src_is_const(array_index) &&
        (!set_layout->has_variable_descriptors ||
-        binding == set_layout->binding_count - 1) &&
+        binding != set_layout->binding_count - 1) &&
        nir_src_as_uint(array_index) < set_layout->binding[binding].array_size;
 }
 
@@ -1411,6 +1412,7 @@ shader_uses_push_consts(nir_shader *shader)
 static bool
 tu_lower_io(nir_shader *shader, struct tu_device *dev,
             struct tu_shader *tu_shader,
+            const struct ir3_shader_key *ir3_key,
             const struct tu_pipeline_layout *layout,
             uint32_t read_only_input_attachments,
             bool dynamic_renderpass,
@@ -1429,7 +1431,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
     */
    if (shader->info.stage == MESA_SHADER_VERTEX) {
       uint32_t num_driver_params =
-         ir3_nir_scan_driver_consts(dev->compiler, shader, nullptr);
+         ir3_nir_scan_driver_consts(dev->compiler, shader, ir3_key, nullptr);
       ir3_alloc_driver_params(const_allocs, &num_driver_params, dev->compiler,
                               shader->info.stage);
    }
@@ -1616,6 +1618,8 @@ struct lower_fdm_options {
    bool adjust_fragcoord;
    bool use_layer;
    bool adjust_gmem_fragcoord;
+   bool gmem_depth_stencil;
+   uint32_t gmem_input_attachment;
 };
 
 static bool
@@ -1629,7 +1633,9 @@ lower_fdm_filter(const nir_instr *instr, const void *data)
 
    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
    return intrin->intrinsic == nir_intrinsic_load_frag_size ||
-      intrin->intrinsic == nir_intrinsic_load_frag_coord_gmem_ir3 ||
+      intrin->intrinsic == nir_intrinsic_load_input_attachment_coord ||
+      intrin->intrinsic == nir_intrinsic_load_depth_input_attachment_coord ||
+      intrin->intrinsic == nir_intrinsic_load_stencil_input_attachment_coord ||
       (intrin->intrinsic == nir_intrinsic_load_frag_coord &&
        options->adjust_fragcoord);
 }
@@ -1642,60 +1648,87 @@ lower_fdm_instr(struct nir_builder *b, nir_instr *instr, void *data)
 
    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
 
-   nir_def *view;
-   if (options->num_views > 1) {
-      gl_varying_slot slot = options->use_layer ?
-         VARYING_SLOT_LAYER : VARYING_SLOT_VIEW_INDEX;
-      nir_variable *view_var =
-         nir_find_variable_with_location(b->shader, nir_var_shader_in,
-                                         slot);
+   gl_varying_slot slot = options->use_layer ?
+      VARYING_SLOT_LAYER : VARYING_SLOT_VIEW_INDEX;
+   nir_variable *layer_var =
+      nir_find_variable_with_location(b->shader, nir_var_shader_in,
+                                      slot);
 
-      if (view_var == NULL) {
-         view_var = nir_variable_create(b->shader, nir_var_shader_in,
-                                        glsl_int_type(), NULL);
-         view_var->data.location = slot;
-         view_var->data.interpolation = INTERP_MODE_FLAT;
-         view_var->data.driver_location = b->shader->num_inputs++;
-      }
+   if (layer_var == NULL) {
+      layer_var = nir_variable_create(b->shader, nir_var_shader_in,
+                                      glsl_int_type(), NULL);
+      layer_var->data.location = slot;
+      layer_var->data.interpolation = INTERP_MODE_FLAT;
+      layer_var->data.driver_location = b->shader->num_inputs++;
+   }
 
-      view = nir_load_var(b, view_var);
-   } else {
+   nir_def *layer = nir_load_var(b, layer_var);
+
+   nir_def *view = layer;
+   if (options->num_views == 1) {
+      /* If FDM is not per-layer, force frag_size/frag_offset to use layer 0.
+       */
       view = nir_imm_int(b, 0);
    }
 
    nir_def *frag_size =
       nir_load_frag_size_ir3(b, view, .range = options->num_views);
 
-   if (intrin->intrinsic == nir_intrinsic_load_frag_coord) {
+   if (intrin->intrinsic == nir_intrinsic_load_frag_coord ||
+       intrin->intrinsic == nir_intrinsic_load_input_attachment_coord ||
+       intrin->intrinsic == nir_intrinsic_load_depth_input_attachment_coord ||
+       intrin->intrinsic == nir_intrinsic_load_stencil_input_attachment_coord) {
       nir_def *frag_offset =
          nir_load_frag_offset_ir3(b, view, .range = options->num_views);
       nir_def *unscaled_coord = nir_load_frag_coord_unscaled_ir3(b);
-      nir_def *xy = nir_trim_vector(b, unscaled_coord, 2);
-      xy = nir_fmul(b, nir_fsub(b, xy, frag_offset), nir_i2f32(b, frag_size));
-      return nir_vec4(b,
-                      nir_channel(b, xy, 0),
-                      nir_channel(b, xy, 1),
-                      nir_channel(b, unscaled_coord, 2),
-                      nir_channel(b, unscaled_coord, 3));
-   }
+      nir_def *unscaled_xy = nir_trim_vector(b, unscaled_coord, 2);
+      nir_def *xy = unscaled_xy;
+      if (options->adjust_fragcoord)
+         xy = nir_fmul(b, nir_fsub(b, unscaled_xy, frag_offset), nir_i2f32(b, frag_size));
 
-   if (intrin->intrinsic == nir_intrinsic_load_frag_coord_gmem_ir3) {
-      nir_def *unscaled_coord = nir_load_frag_coord_unscaled_ir3(b);
+      if (intrin->intrinsic == nir_intrinsic_load_frag_coord) {
+         return nir_vec4(b,
+                         nir_channel(b, xy, 0),
+                         nir_channel(b, xy, 1),
+                         nir_channel(b, unscaled_coord, 2),
+                         nir_channel(b, unscaled_coord, 3));
+      } else {
+         if (options->adjust_fragcoord) {
+            /* Calculate fragment coordinates in rendering space. This is the
+             * space used to access attachments in GMEM.
+             */
+            nir_def *gmem_xy = unscaled_xy;
+            if (options->adjust_gmem_fragcoord) {
+               nir_def *gmem_frag_offset =
+                  nir_load_gmem_frag_offset_ir3(b, view, .range = options->num_views);
+               nir_def *gmem_frag_scale =
+                  nir_load_gmem_frag_scale_ir3(b, view, .range = options->num_views);
+               gmem_xy = nir_fadd(b, nir_fmul(b, unscaled_xy, gmem_frag_scale),
+                                  gmem_frag_offset);
+            }
 
-      if (!options->adjust_gmem_fragcoord)
-         return unscaled_coord;
+            /* Select between gmem_xy (the xy coordinates in rendering space) and
+             * xy (the xy coordinates in framebuffer space) depending on whether
+             * the input attachment is in GMEM or not.
+             */
+            if (intrin->intrinsic == nir_intrinsic_load_depth_input_attachment_coord ||
+                intrin->intrinsic == nir_intrinsic_load_stencil_input_attachment_coord) {
+               if (options->gmem_depth_stencil)
+                  xy = gmem_xy;
+            } else {
+               unsigned base = nir_intrinsic_base(intrin);
+               nir_def *offset = intrin->src[0].ssa;
+               nir_def *is_gmem =
+                  nir_i2b(b, nir_iand(b, nir_ishr(b, nir_imm_int(b, options->gmem_input_attachment >> base), offset),
+                                      nir_imm_int(b, 1)));
+               xy = nir_bcsel(b, is_gmem, gmem_xy, xy);
+            }
+         }
 
-      nir_def *frag_offset =
-         nir_load_gmem_frag_offset_ir3(b, view, .range = options->num_views);
-      nir_def *frag_scale =
-         nir_load_gmem_frag_scale_ir3(b, view, .range = options->num_views);
-      nir_def *xy = nir_trim_vector(b, unscaled_coord, 2);
-      xy = nir_fadd(b, nir_fmul(b, xy, frag_scale), frag_offset);
-      return nir_vec4(b,
-                      nir_channel(b, xy, 0),
-                      nir_channel(b, xy, 1),
-                      nir_channel(b, unscaled_coord, 2),
-                      nir_channel(b, unscaled_coord, 3));
+         xy = nir_f2i32(b, xy);
+         return nir_vec3(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1),
+                         layer);
+      }
    }
 
    assert(intrin->intrinsic == nir_intrinsic_load_frag_size);
@@ -3205,16 +3238,23 @@ tu_upload_shader(struct tu_device *dev,
    struct tu_cs sub_cs;
    tu_cs_begin_sub_stream(&shader->cs, xs_size +
                           tu_xs_get_additional_cs_size_dwords(v), &sub_cs);
+   /* For SW multiview (no HW multiview), pass view_mask=0 to avoid enabling
+    * the HW stereo rendering registers (PC/VFD_STEREO_RENDERING_CNTL).
+    */
+   uint32_t hw_view_mask =
+      dev->physical_device->info->props.has_hw_multiview
+         ? shader->view_mask : 0;
+
    TU_CALLX(dev, tu6_emit_variant)(
       &sub_cs, shader->variant->type, shader->variant, &pvtmem_config,
-      shader->view_mask, iova);
+      hw_view_mask, iova);
    shader->state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
 
    if (safe_const) {
       tu_cs_begin_sub_stream(&shader->cs, xs_size +
                              tu_xs_get_additional_cs_size_dwords(safe_const), &sub_cs);
       TU_CALLX(dev, tu6_emit_variant)(
-         &sub_cs, v->type, safe_const, &pvtmem_config, shader->view_mask,
+         &sub_cs, v->type, safe_const, &pvtmem_config, hw_view_mask,
          safe_const_iova);
       shader->safe_const_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
    }
@@ -3223,7 +3263,7 @@ tu_upload_shader(struct tu_device *dev,
       tu_cs_begin_sub_stream(&shader->cs, xs_size + vpc_size +
                              tu_xs_get_additional_cs_size_dwords(binning), &sub_cs);
       TU_CALLX(dev, tu6_emit_variant)(
-         &sub_cs, v->type, binning, &pvtmem_config, shader->view_mask,
+         &sub_cs, v->type, binning, &pvtmem_config, hw_view_mask,
          binning_iova);
       /* emit an empty VPC */
       TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, binning, NULL, NULL, NULL, NULL);
@@ -3234,7 +3274,7 @@ tu_upload_shader(struct tu_device *dev,
       tu_cs_begin_sub_stream(&shader->cs, xs_size + vpc_size +
          tu_xs_get_additional_cs_size_dwords(safe_const_binning), &sub_cs);
       TU_CALLX(dev, tu6_emit_variant)(
-         &sub_cs, v->type, safe_const_binning, &pvtmem_config, shader->view_mask,
+         &sub_cs, v->type, safe_const_binning, &pvtmem_config, hw_view_mask,
          safe_const_binning_iova);
       /* emit an empty VPC */
       TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, safe_const_binning, NULL, NULL, NULL, NULL);
@@ -3315,41 +3355,44 @@ tu_shader_init(struct tu_device *dev, const void *key_data, size_t key_size)
    return shader;
 }
 
-static bool
-tu_shader_serialize(struct vk_pipeline_cache_object *object,
-                    struct blob *blob)
+template <typename IO>
+static void
+tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
 {
-   struct tu_shader *shader =
-      container_of(object, struct tu_shader, base);
+   io.bytes(&shader->const_state, sizeof(shader->const_state));
+   io.bytes(shader->dynamic_descriptor_sizes, sizeof(shader->dynamic_descriptor_sizes));
+   io.u32(shader->view_mask);
+   io.u8(shader->active_desc_sets);
+   io.boolean(shader->per_layer_viewport);
 
-   blob_write_bytes(blob, &shader->const_state, sizeof(shader->const_state));
-   blob_write_bytes(blob, &shader->dynamic_descriptor_sizes,
-                    sizeof(shader->dynamic_descriptor_sizes));
-   blob_write_uint32(blob, shader->view_mask);
-   blob_write_uint8(blob, shader->active_desc_sets);
-   blob_write_uint8(blob, shader->per_layer_viewport);
+   io.variant(shader->variant);
 
-   ir3_store_variant(blob, shader->variant);
-
-   if (shader->safe_const_variant) {
-      blob_write_uint8(blob, 1);
-      ir3_store_variant(blob, shader->safe_const_variant);
-   } else {
-      blob_write_uint8(blob, 0);
-   }
-
-
+   uint8_t has_safe_const;
+   if constexpr (IO::is_write())
+      has_safe_const = shader->safe_const_variant ? 1 : 0;
+   io.u8(has_safe_const);
+   if (has_safe_const)
+      io.variant(shader->safe_const_variant);
 
    switch (shader->variant->type) {
    case MESA_SHADER_TESS_EVAL:
-      blob_write_bytes(blob, &shader->tes, sizeof(shader->tes));
+      io.bytes(&shader->tes, sizeof(shader->tes));
       break;
    case MESA_SHADER_FRAGMENT:
-      blob_write_bytes(blob, &shader->fs, sizeof(shader->fs));
+      io.bytes(&shader->fs, sizeof(shader->fs));
       break;
    default:
       break;
    }
+}
+
+static bool
+tu_shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
+{
+   struct tu_shader *shader = container_of(object, struct tu_shader, base);
+
+   ir3_blob_write writer { blob };
+   tu_shader_cache_process_blob(writer, shader);
 
    return true;
 }
@@ -3368,29 +3411,8 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
    if (!shader)
       return NULL;
 
-   blob_copy_bytes(blob, &shader->const_state, sizeof(shader->const_state));
-   blob_copy_bytes(blob, &shader->dynamic_descriptor_sizes,
-                   sizeof(shader->dynamic_descriptor_sizes));
-   shader->view_mask = blob_read_uint32(blob);
-   shader->active_desc_sets = blob_read_uint8(blob);
-   shader->per_layer_viewport = blob_read_uint8(blob);
-
-   shader->variant = ir3_retrieve_variant(blob, dev->compiler, NULL);
-
-   bool has_safe_const = blob_read_uint8(blob);
-   if (has_safe_const)
-      shader->safe_const_variant = ir3_retrieve_variant(blob, dev->compiler, NULL);
-
-   switch (shader->variant->type) {
-   case MESA_SHADER_TESS_EVAL:
-      blob_copy_bytes(blob, &shader->tes, sizeof(shader->tes));
-      break;
-   case MESA_SHADER_FRAGMENT:
-      blob_copy_bytes(blob, &shader->fs, sizeof(shader->fs));
-      break;
-   default:
-      break;
-   }
+   ir3_blob_read reader { blob, dev->compiler };
+   tu_shader_cache_process_blob(reader, shader);
 
    VkResult result = tu_upload_shader(dev, shader);
    if (result != VK_SUCCESS) {
@@ -3452,27 +3474,28 @@ tu_lower_nir(struct tu_device *dev,
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
 
+   bool has_hw_multiview =
+      dev->physical_device->info->props.has_hw_multiview;
+
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const nir_input_attachment_options att_options = {
-         /* When using multiview rendering, we must use
-          * gl_ViewIndex as the layer id to pass to the texture
-          * sampling function. gl_Layer doesn't work when
-          * multiview is enabled.
-          */
-         .use_view_id_for_layer = key->multiview_mask != 0,
-         .gmem_depth_stencil_ir3 =
-            key->dynamic_renderpass && !(key->read_only_input_attachments & 1),
-         .gmem_input_attachment_ir3 =
-            key->dynamic_renderpass ?
-            ~(key->read_only_input_attachments >> 1) :
-            key->unscaled_input_fragcoord,
+         .use_ia_coord_intrin = true,
       };
       NIR_PASS(_, nir, nir_lower_input_attachments, &att_options);
 
       const nir_lower_sysvals_to_varyings_options sysval_options = {
          .point_coord = true,
          .layer_id = true,
-         .view_index = true,
+         /* The view index varying relies on the fixed-function view-id
+          * injection at VPC_PS_CNTL::VIEWIDLOC, which only works on devices
+          * with HW multiview.  On devices without it, don't convert
+          * load_view_index to a varying here: with a nonzero view mask
+          * tu_nir_lower_multiview_sw_fs replaces it with a gl_Layer read,
+          * and with a zero view mask tu_nir_lower_view_to_zero folds it to
+          * the spec-mandated constant zero (reading the unwritten varying
+          * would return garbage, at least on a702).
+          */
+         .view_index = has_hw_multiview,
       };
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysval_options);
 
@@ -3480,16 +3503,19 @@ tu_lower_nir(struct tu_device *dev,
                nir_metadata_control_flow, NULL);
    }
 
-   /* This has to happen before lower_input_attachments, because we have to
-    * lower input attachment coordinates except if unscaled.
-    */
    const struct lower_fdm_options fdm_options = {
       .num_views = MAX2(key->multiview_mask ?
                         util_last_bit(key->multiview_mask) :
                         key->max_fdm_layers, 1),
       .adjust_fragcoord = key->fragment_density_map,
-      .use_layer = !key->multiview_mask,
+      .use_layer = !key->multiview_mask || !has_hw_multiview,
       .adjust_gmem_fragcoord = key->fragment_density_map && key->custom_resolve,
+      .gmem_depth_stencil =
+         key->dynamic_renderpass && !(key->read_only_input_attachments & 1),
+      .gmem_input_attachment =
+         key->dynamic_renderpass ?
+         ~(key->read_only_input_attachments >> 1) :
+         key->unscaled_input_fragcoord,
    };
    NIR_PASS(_, nir, tu_nir_lower_fdm, &fdm_options);
 
@@ -3516,8 +3542,26 @@ tu_lower_nir(struct tu_device *dev,
    bool is_last_stage =
     (nir->info.stage == MESA_SHADER_VERTEX && !ir3_key->has_gs && !ir3_key->tessellation);
 
-   if (nir->info.stage == MESA_SHADER_VERTEX && key->multiview_mask)
-      tu_nir_lower_multiview(nir, key->multiview_mask, dev, is_last_stage);
+   if (nir->info.stage == MESA_SHADER_VERTEX && key->multiview_mask) {
+      if (has_hw_multiview) {
+         tu_nir_lower_multiview(nir, key->multiview_mask, dev, is_last_stage);
+      } else if (is_last_stage) {
+         /* SW multiview: the view index is passed as a driver param and
+          * each draw is duplicated per-view on the CPU side.  Add a
+          * gl_Layer output so the rasterizer targets the right layer.
+          */
+         tu_nir_lower_multiview_sw_vs(nir);
+      }
+   }
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && key->multiview_mask &&
+       !has_hw_multiview) {
+      /* SW multiview FS: read the view index from gl_Layer instead of
+       * from the HW-provided view index sysval.
+       */
+      tu_nir_lower_multiview_sw_fs(nir);
+   }
+
    if (nir->info.stage == MESA_SHADER_GEOMETRY)
       nir->info.view_mask = key->multiview_mask;
 
@@ -3637,7 +3681,7 @@ tu_shader_create(struct tu_device *dev,
    }
 
    struct ir3_const_allocations const_allocs = {};
-   NIR_PASS(_, nir, tu_lower_io, dev, shader, layout,
+   NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
             &const_allocs);
 
@@ -4056,6 +4100,22 @@ tu_compile_shaders(struct tu_device *device,
 
    if (nir[MESA_SHADER_GEOMETRY])
       ir3_key.has_gs = true;
+
+   /* On devices without HW multiview support, multiview is emulated by
+    * duplicating draws on the CPU and passing the view index as a VS driver
+    * param.  Flag the ir3 key so the compiler makes load_view_index read that
+    * driver param instead of the HW SYSTEM_VALUE_VIEW_INDEX sysval.
+    */
+   if (!device->physical_device->info->props.has_hw_multiview) {
+      for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+           stage < MESA_SHADER_STAGES;
+           stage = (mesa_shader_stage) (stage + 1)) {
+         if (keys[stage].multiview_mask) {
+            ir3_key.sw_multiview = true;
+            break;
+         }
+      }
+   }
 
    if (nir_initial_disasm) {
       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
