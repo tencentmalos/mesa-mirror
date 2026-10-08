@@ -1848,7 +1848,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
           * on the actual offset, and signficantly changing the performance
           * could result in jank between frames as the offset changes.
           */
-         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_scale_en;
+         bool non_subsampled_use_fast_store = !fdm_offsets && !bin_is_scaled;
          bool subsampled_use_fast_store = non_subsampled_use_fast_store ||
             (tile->subsampled_views == tile->visible_views &&
              !tile->subsampled_border);
@@ -4476,6 +4476,29 @@ tu_cache_init(struct tu_cache_state *cache)
  * tracking the CCU state. It's used for the driver to insert its own command
  * buffer in the middle of a submit.
  */
+/* TU_DEBUG=cmd_no_preempt: keep the CP from preempting inside an application
+ * primary command buffer, so it can only be switched out at IB boundaries.
+ * Diagnostic for mid-IB (level 1) preemption save/restore problems; A7XX+
+ * SQE implements CP_SCOPE_CNTL. Only ever emitted into the BR-executed main
+ * stream, never into draw-state groups (the DDE traps on it).
+ */
+static bool
+tu_cmd_no_preempt(const struct tu_cmd_buffer *cmd_buffer)
+{
+   return TU_DEBUG_START(CMD_NO_PREEMPT) &&
+          cmd_buffer->device->physical_device->info->chip >= 7 &&
+          cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+          cmd_buffer->queue_family_index == TU_QUEUE_GENERAL;
+}
+
+static void
+tu_emit_preempt_scope(struct tu_cs *cs, bool disable)
+{
+   tu_cs_emit_pkt7(cs, CP_SCOPE_CNTL, 1);
+   tu_cs_emit(cs, CP_SCOPE_CNTL_0(.disable_preemption = disable,
+                                  .scope = INTERRUPTS).value);
+}
+
 VkResult
 tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
                     const VkCommandBufferBeginInfo *pBeginInfo)
@@ -4524,6 +4547,8 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
       switch (cmd_buffer->queue_family_index) {
       case TU_QUEUE_GENERAL:
          TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
+         if (tu_cmd_no_preempt(cmd_buffer))
+            tu_emit_preempt_scope(&cmd_buffer->cs, true);
          result = tu_cs_get_status(&cmd_buffer->cs);
          if (result != VK_SUCCESS)
             return vk_command_buffer_set_error(&cmd_buffer->vk, result);
@@ -5481,6 +5506,9 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
 
    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
       tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_IDLE);
+
+   if (tu_cmd_no_preempt(cmd_buffer))
+      tu_emit_preempt_scope(&cmd_buffer->cs, false);
 
    tu_cs_end(&cmd_buffer->cs);
    tu_cs_end(&cmd_buffer->draw_cs);

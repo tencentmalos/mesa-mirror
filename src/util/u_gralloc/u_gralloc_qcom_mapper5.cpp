@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <android/hardware/graphics/mapper/IMapper.h>
 #include "util/log.h"
+#include "drm-uapi/drm_fourcc.h"
 #include "u_gralloc_internal.h"
 #include "u_gralloc_mapper5_metadata.h"
 
@@ -57,6 +58,27 @@ get_buffer_info(u_gralloc *base, u_gralloc_buffer_handle *hnd,
    Planes layout{};
    size = get(15); /* PLANE_LAYOUTS */
    if (!size || !planes(metadata, size, out->alloc_size, layout)) return -EINVAL;
+
+   bool has_qti_meta = false;
+   for (int i = 0; i < layout.count; ++i)
+      has_qti_meta |= layout.qti_metadata[i];
+   if (has_qti_meta) {
+      size = get(12);
+      int64_t compression = 0;
+      if (!size || !extendable(metadata, size, 12, "QTI", compression) ||
+          compression != 10 || out->layer_count != 1 ||
+          (out->modifier != DRM_FORMAT_MOD_LINEAR &&
+           out->modifier != DRM_FORMAT_MOD_QCOM_COMPRESSED) ||
+          (hnd->hal_format != 1 && hnd->hal_format != 2 && hnd->hal_format != 5) ||
+          !qti_rgb32_ubwc(layout))
+         return -ENOTSUP;
+      out->modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
+   }
+   if (!out->drm_fourcc) {
+      int fourcc = get_fourcc_from_hal_format(hnd->hal_format);
+      if (fourcc == -1) return -ENOTSUP;
+      out->drm_fourcc = fourcc;
+   }
 
    int fd_index = 0;
    out->num_planes = layout.count;
