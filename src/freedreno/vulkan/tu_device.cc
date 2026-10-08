@@ -3477,6 +3477,33 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    vk_free(&device->vk.alloc, device);
 }
 
+/* Wine never enables VK_ANDROID_external_memory_android_hardware_buffer for
+ * Windows applications, so the device it creates for a game (e.g. DXVK) hides
+ * the AHB commands even though the driver supports them.  An in-process host
+ * helper that shares that device (the xrgame OpenXR bridge) needs them to
+ * render straight into AHardwareBuffers.  TU_EXPOSE_AHB_ENTRYPOINTS=1 returns
+ * those two commands whenever the physical device supports the extension.
+ */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+tu_GetDeviceProcAddr(VkDevice _device, const char *pName)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+   PFN_vkVoidFunction func = vk_device_get_proc_addr(&device->vk, pName);
+#if DETECT_OS_ANDROID
+   if (!func && pName &&
+       device->vk.physical->supported_extensions.ANDROID_external_memory_android_hardware_buffer &&
+       (strcmp(pName, "vkGetAndroidHardwareBufferPropertiesANDROID") == 0 ||
+        strcmp(pName, "vkGetMemoryAndroidHardwareBufferANDROID") == 0)) {
+      static int expose = -1;
+      if (expose < 0)
+         expose = debug_get_bool_option("TU_EXPOSE_AHB_ENTRYPOINTS", false);
+      if (expose)
+         func = vk_device_dispatch_table_get(&device->vk.dispatch_table, pName);
+   }
+#endif
+   return func;
+}
+
 VkResult
 tu_get_scratch_bo(struct tu_device *dev, uint64_t size, struct tu_bo **bo)
 {
