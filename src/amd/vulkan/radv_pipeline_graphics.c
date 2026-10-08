@@ -364,7 +364,6 @@ radv_pipeline_needed_dynamic_state(const struct radv_device *device, const struc
                                    const struct vk_graphics_pipeline_state *state)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   bool has_color_att = radv_pipeline_has_color_attachments(state->rp);
    bool raster_enabled =
       !state->rs->rasterizer_discard_enable || (pipeline->dynamic_states & RADV_DYNAMIC_RASTERIZER_DISCARD_ENABLE);
    uint64_t states = RADV_DYNAMIC_ALL;
@@ -416,7 +415,7 @@ radv_pipeline_needed_dynamic_state(const struct radv_device *device, const struc
        (!state->ms || !state->ms->sample_locations_enable))
       states &= ~RADV_DYNAMIC_SAMPLE_LOCATIONS;
 
-   if (!has_color_att || !radv_pipeline_is_blend_enabled(pipeline, state->cb))
+   if (!radv_pipeline_is_blend_enabled(pipeline, state->cb))
       states &= ~RADV_DYNAMIC_BLEND_CONSTANTS;
 
    if (!(pipeline->active_stages & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT))
@@ -424,6 +423,9 @@ radv_pipeline_needed_dynamic_state(const struct radv_device *device, const struc
 
    if (pipeline->dynamic_states & RADV_DYNAMIC_VERTEX_INPUT)
       states &= ~RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE;
+
+   if (!radv_pipeline_has_color_attachments(state->rp))
+      states &= ~RADV_DYNAMIC_CB_STATES;
 
    return states;
 }
@@ -1038,47 +1040,45 @@ radv_pipeline_init_dynamic_state(const struct radv_device *device, struct radv_g
       typed_memcpy(dynamic->vk.cb.blend_constants, state->cb->blend_constants, 4);
    }
 
-   if (radv_pipeline_has_color_attachments(state->rp)) {
-      if (states & RADV_DYNAMIC_LOGIC_OP) {
-         if ((pipeline->dynamic_states & RADV_DYNAMIC_LOGIC_OP_ENABLE) || state->cb->logic_op_enable) {
-            dynamic->vk.cb.logic_op = radv_translate_blend_logic_op(state->cb->logic_op);
-         }
+   if (states & RADV_DYNAMIC_LOGIC_OP) {
+      if ((pipeline->dynamic_states & RADV_DYNAMIC_LOGIC_OP_ENABLE) || state->cb->logic_op_enable) {
+         dynamic->vk.cb.logic_op = radv_translate_blend_logic_op(state->cb->logic_op);
+      }
+   }
+
+   if (states & RADV_DYNAMIC_COLOR_WRITE_ENABLE) {
+      u_foreach_bit (i, state->cb->color_write_enables) {
+         dynamic->color_write_enable |= BITFIELD_RANGE(i * 4, 4);
+      }
+   }
+
+   if (states & RADV_DYNAMIC_LOGIC_OP_ENABLE) {
+      dynamic->vk.cb.logic_op_enable = state->cb->logic_op_enable;
+   }
+
+   if (states & RADV_DYNAMIC_COLOR_WRITE_MASK) {
+      for (unsigned i = 0; i < state->cb->attachment_count; i++) {
+         dynamic->color_write_mask |= (uint32_t)state->cb->attachments[i].write_mask << (4 * i);
+      }
+   }
+
+   if (states & RADV_DYNAMIC_COLOR_BLEND_ENABLE) {
+      for (unsigned i = 0; i < state->cb->attachment_count; i++) {
+         dynamic->color_blend_enable |= state->cb->attachments[i].blend_enable << i;
+      }
+   }
+
+   if (states & RADV_DYNAMIC_COLOR_BLEND_EQUATION) {
+      for (unsigned i = 0; i < state->cb->attachment_count; i++) {
+         const struct vk_color_blend_attachment_state *att = &state->cb->attachments[i];
+
+         radv_translate_blend_equation(pdev, att->color_blend_op, att->src_color_blend_factor,
+                                       att->dst_color_blend_factor, att->alpha_blend_op, att->src_alpha_blend_factor,
+                                       att->dst_alpha_blend_factor, &dynamic->blend_eq.att[i].cb_blend_control,
+                                       &dynamic->blend_eq.att[i].sx_mrt_blend_opt);
       }
 
-      if (states & RADV_DYNAMIC_COLOR_WRITE_ENABLE) {
-         u_foreach_bit (i, state->cb->color_write_enables) {
-            dynamic->color_write_enable |= BITFIELD_RANGE(i * 4, 4);
-         }
-      }
-
-      if (states & RADV_DYNAMIC_LOGIC_OP_ENABLE) {
-         dynamic->vk.cb.logic_op_enable = state->cb->logic_op_enable;
-      }
-
-      if (states & RADV_DYNAMIC_COLOR_WRITE_MASK) {
-         for (unsigned i = 0; i < state->cb->attachment_count; i++) {
-            dynamic->color_write_mask |= (uint32_t)state->cb->attachments[i].write_mask << (4 * i);
-         }
-      }
-
-      if (states & RADV_DYNAMIC_COLOR_BLEND_ENABLE) {
-         for (unsigned i = 0; i < state->cb->attachment_count; i++) {
-            dynamic->color_blend_enable |= state->cb->attachments[i].blend_enable << i;
-         }
-      }
-
-      if (states & RADV_DYNAMIC_COLOR_BLEND_EQUATION) {
-         for (unsigned i = 0; i < state->cb->attachment_count; i++) {
-            const struct vk_color_blend_attachment_state *att = &state->cb->attachments[i];
-
-            radv_translate_blend_equation(pdev, att->color_blend_op, att->src_color_blend_factor,
-                                          att->dst_color_blend_factor, att->alpha_blend_op, att->src_alpha_blend_factor,
-                                          att->dst_alpha_blend_factor, &dynamic->blend_eq.att[i].cb_blend_control,
-                                          &dynamic->blend_eq.att[i].sx_mrt_blend_opt);
-         }
-
-         dynamic->blend_eq.mrt0_is_dual_src = radv_can_enable_dual_src(&state->cb->attachments[0]);
-      }
+      dynamic->blend_eq.mrt0_is_dual_src = radv_can_enable_dual_src(&state->cb->attachments[0]);
    }
 
    if (states & RADV_DYNAMIC_DISCARD_RECTANGLE_ENABLE) {
@@ -2635,7 +2635,9 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
       NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, nir_opt_dce);
 
       const bool vrs_may_be_enabled =
-         gfx_state->vrs_may_be_enabled && !stages[MESA_SHADER_FRAGMENT].nir->info.fs.sample_mask_in_declared;
+         gfx_state->vrs_may_be_enabled && !(stages[MESA_SHADER_FRAGMENT].nir->info.fs.sample_mask_in_declared ||
+                                            stages[MESA_SHADER_FRAGMENT].nir->info.fs.sample_mask_out_declared);
+
       NIR_PASS(_, stages[MESA_SHADER_FRAGMENT].nir, radv_nir_lower_opt_fs_frag_pos, vrs_may_be_enabled,
                gfx_state->ms.sample_shading_enable || stages[MESA_SHADER_FRAGMENT].nir->info.fs.uses_sample_shading);
 
@@ -2750,7 +2752,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
 
       struct radv_shader_stage *fs_stage = &stages[MESA_SHADER_FRAGMENT];
 
-      if (fs_stage && (fs_stage->info.ps.allow_flat_shading || fs_stage->info.ps.force_disable_vrs)) {
+      if (fs_stage->nir && (fs_stage->info.ps.allow_flat_shading || fs_stage->info.ps.force_disable_vrs)) {
          stages[i].info.force_vrs_per_vertex = false;
 
          if (stages[i].info.outinfo.writes_primitive_shading_rate ||
@@ -2762,7 +2764,8 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
             stages[i].nir->info.outputs_written &= ~VARYING_BIT_PRIMITIVE_SHADING_RATE;
             stages[i].nir->info.per_primitive_outputs &= ~VARYING_BIT_PRIMITIVE_SHADING_RATE;
          }
-      } else if (fs_stage && fs_stage->info.ps.disallow_force_vrs_per_vertex && stages[i].info.force_vrs_per_vertex) {
+      } else if (fs_stage->nir && fs_stage->info.ps.disallow_force_vrs_per_vertex &&
+                 stages[i].info.force_vrs_per_vertex) {
          stages[i].info.force_vrs_per_vertex = false;
          stages[i].info.outinfo.writes_primitive_shading_rate = false;
 

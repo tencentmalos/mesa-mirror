@@ -22,10 +22,15 @@ prelude = r'''
 #include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #define MIN2(a,b) std::min<uint64_t>(a,b)
 using VkResult = int;
-constexpr int VK_SUCCESS=0, VK_TIMEOUT=2, VK_ERROR_DEVICE_LOST=-4;
+constexpr int VK_SUCCESS=0, VK_TIMEOUT=2, VK_ERROR_DEVICE_LOST=-4, VK_ERROR_UNKNOWN=-13;
+struct tu_device { int fd=7; int vk=0; };
+static tu_device device;
+static VkResult vk_device_set_lost(int *, const char *, ...) { return VK_ERROR_DEVICE_LOST; }
+static VkResult vk_errorf(tu_device *, VkResult result, const char *, ...) { return result; }
 constexpr unsigned KGSL_TIMESTAMP_RETIRED=2;
 constexpr unsigned IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID=1;
 constexpr unsigned IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID=2;
@@ -73,42 +78,42 @@ int main() {
    CHECK(get_relative_ms(fake_now+999999) == 1);
    CHECK(get_relative_ms(fake_now+1000000) == 1);
    CHECK(get_relative_ms(fake_now+1000001) == 2);
-   CHECK(get_relative_ms(fake_now+(uint64_t(INT_MAX)+9)*1000000) == INT_MAX);
+   CHECK(get_relative_ms(fake_now+(uint64_t(INT_MAX)+9)*1000000) == -1);
    CHECK(get_relative_ms(UINT64_MAX) == -1);
    CHECK(get_relative_ms(INT64_MAX) == -1);
    for (uint64_t deadline : {uint64_t(0), fake_now-1, fake_now}) {
-      CHECK(wait_timestamp_safe(7,42,10,deadline) == VK_TIMEOUT);
+      CHECK(wait_timestamp_safe(&device,42,10,deadline) == VK_TIMEOUT);
       CHECK(waits == 0);
       retired=10;
-      CHECK(wait_timestamp_safe(7,42,10,deadline) == VK_SUCCESS);
+      CHECK(wait_timestamp_safe(&device,42,10,deadline) == VK_SUCCESS);
       retired=11;
-      CHECK(wait_timestamp_safe(7,42,10,deadline) == VK_SUCCESS);
+      CHECK(wait_timestamp_safe(&device,42,10,deadline) == VK_SUCCESS);
       retired=9;
    }
    retired=0;
-   CHECK(wait_timestamp_safe(7,42,UINT_MAX,0) == VK_SUCCESS);
+   CHECK(wait_timestamp_safe(&device,42,UINT_MAX,0) == VK_SUCCESS);
    retired=UINT_MAX;
-   CHECK(wait_timestamp_safe(7,42,0,0) == VK_TIMEOUT);
+   CHECK(wait_timestamp_safe(&device,42,0,0) == VK_TIMEOUT);
    read_error=EINVAL;
-   CHECK(wait_timestamp_safe(7,42,0,0) == VK_ERROR_DEVICE_LOST);
+   CHECK(wait_timestamp_safe(&device,42,0,0) == VK_ERROR_UNKNOWN);
    CHECK(waits == 0);
    reset(); steps={{0,0,1}};
-   CHECK(wait_timestamp_safe(7,42,10,fake_now+1) == VK_SUCCESS);
+   CHECK(wait_timestamp_safe(&device,42,10,fake_now+1) == VK_SUCCESS);
    CHECK(reads == 0 && waits == 1);
    reset(); steps={{ETIMEDOUT,1000000,1}};
-   CHECK(wait_timestamp_safe(7,42,10,fake_now+999999) == VK_TIMEOUT);
+   CHECK(wait_timestamp_safe(&device,42,10,fake_now+999999) == VK_TIMEOUT);
    reset(); steps={{EDEADLK,0,1}};
-   CHECK(wait_timestamp_safe(7,42,10,fake_now+1) == VK_ERROR_DEVICE_LOST);
+   CHECK(wait_timestamp_safe(&device,42,10,fake_now+1) == VK_ERROR_DEVICE_LOST);
    reset(); steps={{0,0,UINT_MAX}};
-   CHECK(wait_timestamp_safe(7,42,10,UINT64_MAX) == VK_SUCCESS);
+   CHECK(wait_timestamp_safe(&device,42,10,UINT64_MAX) == VK_SUCCESS);
    reset(); steps={{EINTR,1000000,2},{0,0,1}};
-   CHECK(wait_timestamp_safe(7,42,10,fake_now+2000000) == VK_SUCCESS);
+   CHECK(wait_timestamp_safe(&device,42,10,fake_now+2000000) == VK_SUCCESS);
    CHECK(waits == 2 && reads == 0);
    reset(); steps={{EAGAIN,1000000,1}};
-   CHECK(wait_timestamp_safe(7,42,10,fake_now+1) == VK_TIMEOUT);
+   CHECK(wait_timestamp_safe(&device,42,10,fake_now+1) == VK_TIMEOUT);
    CHECK(waits == 1 && reads == 1);
    reset(); retired=10; steps={{EINTR,1000000,1}};
-   CHECK(wait_timestamp_safe(7,42,10,fake_now+1) == VK_SUCCESS);
+   CHECK(wait_timestamp_safe(&device,42,10,fake_now+1) == VK_SUCCESS);
    CHECK(waits == 1 && reads == 1);
    std::printf("KGSL_WAIT_PASS checks=%u\n",checks);
 }

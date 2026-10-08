@@ -1,6 +1,7 @@
 # Copyright 2018 Google LLC
 # SPDX-License-Identifier: MIT
 from copy import copy
+import re
 
 from .common.codegen import CodeGen, VulkanAPIWrapper
 from .common.vulkantypes import \
@@ -176,8 +177,15 @@ class VulkanReservedMarshalingCodegen(VulkanTypeIterator):
         if "" == self.handlemapPrefix:
             mapFunc = ("(%s)" % vulkanType.typeName)
             mapFunc64 = ("(%s)" % "uint64_t")
-        else:
+        elif self.handlemapPrefix == "gfxstream_to_host_u64":
+            gfxstreamType = "gfxstream_" + re.sub(r'(?<!^)(?=[A-Z][a-z]|(?<=[a-z])[A-Z])', '_', vulkanType.typeName).lower()
+            mapFunc = gfxstreamType + "_to_host_u64"
+            mapFunc64 = mapFunc
+        elif self.handlemapPrefix.endswith("_"):
             mapFunc = self.handlemapPrefix + vulkanType.typeName
+            mapFunc64 = mapFunc
+        else:
+            mapFunc = self.handlemapPrefix
             mapFunc64 = mapFunc
 
         if self.direction == "write":
@@ -316,7 +324,7 @@ class VulkanReservedMarshalingCodegen(VulkanTypeIterator):
         if needConsistencyCheck and featureExpr is None:
             self.cgen.beginIf("!(%s)" % checkName)
             self.cgen.stmt(
-                "fprintf(stderr, \"fatal: %s inconsistent between guest and host\\n\")" % (access))
+                "GFXSTREAM_ERROR(\"fatal: %s inconsistent between guest and host\")" % (access))
             self.cgen.endIf()
 
     def onCheckWithNullOptionalStringFeature(self, vulkanType):
@@ -740,7 +748,7 @@ class VulkanReservedMarshaling(VulkanWrapperGenerator):
                 MARSHAL_INPUT_VAR_NAME,
                 self.ptrVarName,
                 API_PREFIX_RESERVEDMARSHAL,
-                "get_host_u64_" if "guest" == self.variant else "",
+                "gfxstream_to_host_u64" if "guest" == self.variant else "",
                 direction = "write")
 
         self.readCodegen = \
@@ -1013,8 +1021,9 @@ class VulkanReservedMarshaling(VulkanWrapperGenerator):
         def fatalDefault(cgen):
             cgen.line("// fatal; the switch is only taken if the extension struct is known")
             if self.variant != "guest":
-                cgen.stmt("fprintf(stderr, \" %s, Unhandled Vulkan structure type %s [%d], aborting.\\n\", __func__, string_VkStructureType(VkStructureType(structType)), structType)")
-            cgen.stmt("abort()")
+                cgen.stmt("GFXSTREAM_FATAL(\"%s, Unhandled Vulkan structure type %s [%d], aborting.\", __func__, string_VkStructureType(VkStructureType(structType)), structType)")
+            else:
+                cgen.stmt("abort()")
             pass
 
         self.emitForEachStructExtension(

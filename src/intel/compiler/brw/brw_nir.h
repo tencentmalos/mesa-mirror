@@ -52,6 +52,9 @@ struct brw_nir_compiler_opts {
 
    /* Input vertices for TCS stage (0 means dynamic) */
    unsigned input_vertices;
+
+   /* Which code motion pass to run (0 means let the compiler pick) */
+   enum intel_code_motion code_motion;
 };
 
 /* UBO surface index can come in 2 flavors :
@@ -311,6 +314,7 @@ bool brw_nir_lower_texture(nir_shader *nir);
 bool brw_nir_lower_sample_index_in_coord(nir_shader *nir);
 
 bool brw_nir_lower_immediate_offsets(nir_shader *shader,
+                                     const struct intel_device_info *devinfo,
                                      bool efficient_64bit);
 
 bool brw_nir_lower_mem_access_bit_sizes(nir_shader *shader,
@@ -395,7 +399,7 @@ brw_uniform_block_size(const struct intel_device_info *devinfo,
 }
 
 void brw_nir_cleanup_pre_fs_prog_data(struct brw_pass_tracker *pt);
-void brw_nir_optimize(struct brw_pass_tracker *pt);
+void brw_nir_optimize(struct brw_pass_tracker *pt, bool run_code_motion);
 
 bool brw_nir_move_interpolation_to_top(nir_shader *nir);
 nir_def *brw_nir_load_global_const(nir_builder *b,

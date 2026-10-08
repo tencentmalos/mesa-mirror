@@ -243,7 +243,9 @@ struct brw_base_prog_key {
 
    enum intel_atomic_branch_cases atomic_branch_flags:3;
 
-   uint32_t padding:21;
+   enum intel_code_motion code_motion:2;
+
+   uint32_t padding:19;
 };
 
 /**
@@ -515,6 +517,9 @@ struct brw_stage_prog_data {
    unsigned grf_used;
 
    uint64_t source_hash;
+
+   /* Was this shader compiled with Jay? */
+   bool is_jay;
 };
 
 enum brw_pixel_shader_computed_depth_mode {
@@ -948,7 +953,6 @@ struct brw_vs_prog_data {
 
    bool uses_vertexid;
    bool uses_instanceid;
-   bool uses_is_indexed_draw;
    bool uses_firstvertex;
    bool uses_baseinstance;
    bool uses_drawid;

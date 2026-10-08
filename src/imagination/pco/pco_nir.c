@@ -39,12 +39,12 @@ static const struct spirv_to_nir_options spirv_options = {
 /** NIR options. */
 static const nir_shader_compiler_options nir_options = {
    .discard_is_demote = true,
+   .has_imad32 = true,
    .float_mul_add32 = nir_float_muladd_support_has_ffma |
                       nir_float_muladd_support_fuse,
 
    .has_f2i32_rtne = true,
    .has_fused_comp_and_csel = true,
-   .has_tanh = true,
 
    .instance_id_includes_base_index = true,
 
@@ -530,7 +530,7 @@ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, pco_data *data, bool alge
 
       NIR_PASS(progress, nir, nir_opt_phi_precision);
       NIR_PASS(progress, nir, nir_lower_alu);
-      NIR_PASS(progress, nir, pco_nir_lower_alu, ctx);
+      NIR_PASS(progress, nir, pco_nir_lower_alu);
       NIR_PASS(progress, nir, nir_lower_pack);
 
       if (algebraic) {

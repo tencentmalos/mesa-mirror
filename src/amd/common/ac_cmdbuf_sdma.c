@@ -13,6 +13,17 @@
 
 #include "util/u_math.h"
 
+static uint32_t
+ac_sdma_max_img_extent(const enum sdma_version ver)
+{
+   if (ver >= SDMA_7_0)
+      return 65536;
+   else if (ver >= SDMA_2_4)
+      return 16384;
+   else
+      return 16383; /* Just 1 pixel smaller than maximum supported image size... */
+}
+
 void
 ac_emit_sdma_nop(struct ac_cmdbuf *cs)
 {
@@ -33,37 +44,63 @@ ac_emit_sdma_write_timestamp(struct ac_cmdbuf *cs, uint64_t va)
 }
 
 void
-ac_emit_sdma_fence(struct ac_cmdbuf *cs, uint64_t va, uint32_t fence)
+ac_emit_sdma_fence(struct ac_cmdbuf *const cs,
+                   const enum sdma_version sdma_ip_version,
+                   const uint64_t va, const uint32_t fence)
 {
    ac_cmdbuf_begin(cs);
+
+   /* Use NOP before FENCE on SDMA 2.4-3.1 to prevent hangs.
+    * We noticed the hang on the Polaris 10 job in the Mesa CI.
+    * Note that this issue is not documented or acknowledged by AMD.
+    */
+   if (sdma_ip_version >= SDMA_2_4 && sdma_ip_version <= SDMA_3_1)
+      ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0));
+
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_FENCE, 0, SDMA_FENCE_MTYPE_UC));
    ac_cmdbuf_emit(va);
    ac_cmdbuf_emit(va >> 32);
    ac_cmdbuf_emit(fence);
+
    ac_cmdbuf_end();
 }
 
 void
-ac_emit_sdma_wait_mem(struct ac_cmdbuf *cs, uint32_t op, uint64_t va, uint32_t ref, uint32_t mask)
+ac_emit_sdma_wait_mem(struct ac_cmdbuf *const cs,
+                      const enum sdma_version sdma_ip_version,
+                      const uint32_t op, const uint64_t va,
+                      const uint32_t ref, const uint32_t mask)
 {
    ac_cmdbuf_begin(cs);
+
+   /* Use NOP before POLL_REGMEM on SDMA 2.4-3.1 to prevent hangs.
+    * We noticed the hang on the Polaris 10 job in the Mesa CI.
+    * Note that this issue is not documented or acknowledged by AMD.
+    */
+   if (sdma_ip_version >= SDMA_2_4 && sdma_ip_version <= SDMA_3_1)
+      ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0));
+
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_POLL_REGMEM, 0, 0) | op << 28 | SDMA_POLL_MEM);
    ac_cmdbuf_emit(va);
    ac_cmdbuf_emit(va >> 32);
    ac_cmdbuf_emit(ref);
    ac_cmdbuf_emit(mask);
    ac_cmdbuf_emit(SDMA_POLL_INTERVAL_160_CLK | SDMA_POLL_RETRY_INDEFINITELY << 16);
+
    ac_cmdbuf_end();
 }
 
 void
-ac_emit_sdma_write_data_head(struct ac_cmdbuf *cs, uint64_t va, uint32_t count)
+ac_emit_sdma_write_data_head(struct ac_cmdbuf *cs, enum sdma_version ver, uint64_t va, uint32_t count)
 {
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_WRITE, SDMA_WRITE_SUB_OPCODE_LINEAR, 0));
    ac_cmdbuf_emit(va);
    ac_cmdbuf_emit(va >> 32);
-   ac_cmdbuf_emit(count - 1);
+   if (ver >= SDMA_4_0)
+      ac_cmdbuf_emit(count - 1);
+   else
+      ac_cmdbuf_emit(count);
    ac_cmdbuf_end();
 }
 
@@ -73,8 +110,6 @@ ac_emit_sdma_constant_fill(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_versi
 {
    const uint32_t fill_size = 2; /* This means that count is in DWORDS. */
 
-   assert(sdma_ip_version >= SDMA_2_4);
-
    const uint64_t max_fill_size = BITFIELD64_MASK(sdma_ip_version >= SDMA_6_0 ? 30 : 22) & ~0x3;
    const uint64_t bytes_written = MIN2(size, max_fill_size);
 
@@ -83,7 +118,10 @@ ac_emit_sdma_constant_fill(struct ac_cmdbuf *cs, enum sdma_version sdma_ip_versi
    ac_cmdbuf_emit(va);
    ac_cmdbuf_emit(va >> 32);
    ac_cmdbuf_emit(value);
-   ac_cmdbuf_emit(bytes_written - 1); /* Must be programmed in bytes, even if the fill is done in dwords. */
+   if (sdma_ip_version >= SDMA_4_0)
+      ac_cmdbuf_emit(bytes_written - 1); /* Must be programmed in bytes, even if the fill is done in dwords. */
+   else
+      ac_cmdbuf_emit(bytes_written);
    ac_cmdbuf_end();
 
    return bytes_written;
@@ -149,8 +187,10 @@ ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma
                                     const struct ac_sdma_surf *dst,
                                     uint32_t width, uint32_t height, uint32_t depth)
 {
-   /* This packet is the same since SDMA v2.4, haven't bothered to check older versions.
-    * The main difference is the bitfield sizes:
+   assert(width <= ac_sdma_max_img_extent(sdma_ip_version));
+   assert(height <= ac_sdma_max_img_extent(sdma_ip_version));
+
+   /* Bitfield sizes between different SDMA versions:
     *
     * v2.4 - src/dst_pitch: 14 bits (shift: 16), rect_z: 11 bits
     * v4.0 - src/dst_pitch: 19 bits (shift: 13), rect_z: 11 bits
@@ -177,12 +217,12 @@ ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma
    ac_cmdbuf_emit(dst->offset.x | dst->offset.y << 16);
    ac_cmdbuf_emit(dst->offset.z | (dst->pitch - 1) << pitch_shift);
    ac_cmdbuf_emit(dst->slice_pitch - 1);
-   if (sdma_ip_version == SDMA_2_0) {
-      ac_cmdbuf_emit(width | (height << 16));
-      ac_cmdbuf_emit(depth);
-   } else {
+   if (sdma_ip_version >= SDMA_2_4) {
       ac_cmdbuf_emit((width - 1) | (height - 1) << 16);
       ac_cmdbuf_emit((depth - 1));
+   } else {
+      ac_cmdbuf_emit(width | (height << 16));
+      ac_cmdbuf_emit(depth);
    }
    ac_cmdbuf_end();
 }
@@ -204,8 +244,8 @@ ac_sdma_get_tiled_header_dword(enum sdma_version sdma_ip_version,
 }
 
 static enum gfx9_resource_type
-ac_sdma_get_tiled_resource_dim(enum sdma_version sdma_ip_version,
-                               const struct ac_sdma_surf *tiled)
+ac_sdma_get_tiled_resource_dim_gfx9(enum sdma_version sdma_ip_version,
+                                    const struct ac_sdma_surf *tiled)
 {
    if (sdma_ip_version >= SDMA_5_0) {
       /* Use the 2D resource type for rotated or Z swizzles. */
@@ -223,20 +263,21 @@ static uint32_t
 ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
                              const struct ac_sdma_surf *tiled)
 {
-   const uint32_t swizzle_mode =
-      tiled->is_stencil ? tiled->surf->u.gfx9.zs.stencil_swizzle_mode
-                        : tiled->surf->u.gfx9.swizzle_mode;
-   const uint16_t epitch =
-      tiled->is_stencil ? tiled->surf->u.gfx9.zs.stencil_epitch
-                        : tiled->surf->u.gfx9.epitch;
-   const enum gfx9_resource_type dimension =
-      ac_sdma_get_tiled_resource_dim(info->sdma_ip_version, tiled);
    const uint32_t mip_max = MAX2(tiled->num_levels, 1);
    const uint32_t mip_id = tiled->first_level;
    const uint32_t element_size = util_logbase2(tiled->bpp);
    uint32_t info_dword = 0;
 
    if (info->sdma_ip_version >= SDMA_4_0) {
+      const uint32_t swizzle_mode =
+         tiled->is_stencil ? tiled->surf->u.gfx9.zs.stencil_swizzle_mode
+                           : tiled->surf->u.gfx9.swizzle_mode;
+      const uint16_t epitch =
+         tiled->is_stencil ? tiled->surf->u.gfx9.zs.stencil_epitch
+                           : tiled->surf->u.gfx9.epitch;
+      const enum gfx9_resource_type dimension =
+         ac_sdma_get_tiled_resource_dim_gfx9(info->sdma_ip_version, tiled);
+
       info_dword |= element_size;
       info_dword |= swizzle_mode << 3;
 
@@ -248,16 +289,21 @@ ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
          return info_dword | dimension << 9 | epitch << 16;
       }
    } else {
-      const uint32_t tile_index = tiled->surf->u.legacy.tiling_index[0];
+      const uint32_t tile_index = ac_surface_get_legacy_tiling_index(tiled->surf, tiled->first_level, tiled->is_stencil);
       const uint32_t macro_tile_index = tiled->surf->u.legacy.macro_tile_index;
       const uint32_t tile_mode = info->si_tile_mode_array[tile_index];
-      const uint32_t macro_tile_mode = info->cik_macrotile_mode_array[macro_tile_index];
+      const uint32_t macro_tile_mode =
+         G_009910_ARRAY_MODE(tile_mode) >= V_009910_ARRAY_2D_TILED_THIN1
+            ? info->cik_macrotile_mode_array[macro_tile_index]
+            : 0;
+      const uint32_t tile_split_bytes =
+         tiled->is_stencil ? tiled->surf->u.legacy.stencil_tile_split
+                           : tiled->surf->u.legacy.tile_split;
 
       return element_size |
              (G_009910_ARRAY_MODE(tile_mode) << 3) |
              (G_009910_MICRO_TILE_MODE_NEW(tile_mode) << 8) |
-             /* Non-depth modes don't have TILE_SPLIT set. */
-             ((util_logbase2(tiled->surf->u.legacy.tile_split >> 6)) << 11) |
+             (util_logbase2(tile_split_bytes / 64) << 11) |
              (G_009990_BANK_WIDTH(macro_tile_mode) << 15) |
              (G_009990_BANK_HEIGHT(macro_tile_mode) << 18) |
              (G_009990_NUM_BANKS(macro_tile_mode) << 21) |
@@ -318,6 +364,34 @@ ac_sdma5_get_metadata_config(const struct radeon_info *info,
           SDMA5_DCC_TMZ(tmz);
 }
 
+/**
+ * Return the maximum pitch of a tiled surface in units of tiles.
+ */
+static uint32_t
+ac_sdma2_get_pitch_in_tile_max(const struct ac_sdma_surf *tiled)
+{
+   const uint32_t tile_width = 8;
+   const struct legacy_surf_level *legacy_level =
+      ac_surface_get_legacy_level(tiled->surf, tiled->first_level, tiled->is_stencil);
+
+   return legacy_level->nblk_x / tile_width;
+}
+
+/**
+ * Return the maximum slice pitch of a tiled surface in units of tiles.
+ */
+static uint32_t
+ac_sdma2_get_slice_pitch_in_tile_max(const struct ac_sdma_surf *tiled)
+{
+   const uint32_t tile_width = 8;
+   const uint32_t tile_height = 8;
+   const uint32_t tile_pixels = tile_width * tile_height;
+   const struct legacy_surf_level *legacy_level =
+      ac_surface_get_legacy_level(tiled->surf, tiled->first_level, tiled->is_stencil);
+
+   return (uint64_t)legacy_level->slice_size_dw * 4 / tiled->bpp / tile_pixels;
+}
+
 void
 ac_emit_sdma_copy_tiled_sub_window(struct ac_cmdbuf *cs, const struct radeon_info *info,
                                    const struct ac_sdma_surf *linear,
@@ -325,46 +399,85 @@ ac_emit_sdma_copy_tiled_sub_window(struct ac_cmdbuf *cs, const struct radeon_inf
                                    bool detile, uint32_t width, uint32_t height,
                                    uint32_t depth, bool tmz)
 {
+   const enum sdma_version sdma_ip_version = info->sdma_ip_version;
+
+   assert(width <= ac_sdma_max_img_extent(sdma_ip_version));
+   assert(height <= ac_sdma_max_img_extent(sdma_ip_version));
+
    const uint32_t header_dword =
-      ac_sdma_get_tiled_header_dword(info->sdma_ip_version, tiled);
+      ac_sdma_get_tiled_header_dword(sdma_ip_version, tiled);
    const uint32_t info_dword =
       ac_sdma_get_tiled_info_dword(info, tiled);
    const bool dcc =
-      info->sdma_ip_version >= SDMA_7_0 ? (linear->is_compressed || tiled->is_compressed)
+      sdma_ip_version >= SDMA_7_0 ? (linear->is_compressed || tiled->is_compressed)
                                         : tiled->is_compressed;
+   uint32_t tiled_cp = 0, linear_cp = 0;
+   bool cpv = false;
+
+   if (info->sdma_ip_version == SDMA_5_2) {
+      uint32_t rd_cp = SDMA_5_2_CP_LLC_NOALLOC;
+      uint32_t wr_cp = SDMA_5_2_CP_LLC_NOALLOC;
+
+      if (dcc) {
+         /* SDMA 5.2 (GFX10.3) seems to have a cache coherency issue with GL2
+          * and DCC which causes random corruption. Overwrite the default
+          * cache policy and force NOA for writes and LRU for reads which
+          * seems the only combination to workaround it.
+          */
+         rd_cp |= SDMA_5_2_CP_GL2_LRU;
+         wr_cp |= SDMA_5_2_CP_GL2_NOA;
+      } else {
+         /* Use the default cache policy. */
+         rd_cp |= SDMA_5_2_CP_GL2_NOA;
+         wr_cp |= SDMA_5_2_CP_GL2_BYPASS;
+      }
+
+      tiled_cp = detile ? rd_cp : wr_cp;
+      linear_cp = detile ? wr_cp : rd_cp;
+      cpv = true;
+   }
 
    /* Sanity checks. */
    const bool uses_depth = linear->offset.z != 0 || tiled->offset.z != 0 || depth != 1;
    assert(util_is_power_of_two_nonzero(tiled->bpp));
-   ac_sdma_check_pitches(info->sdma_ip_version, linear->pitch, linear->slice_pitch,
+   ac_sdma_check_pitches(sdma_ip_version, linear->pitch, linear->slice_pitch,
                          tiled->bpp, uses_depth);
    if (!info->sdma_supports_compression)
       assert(!tiled->is_compressed);
 
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_TILED_SUB_WINDOW, (tmz ? 4 : 0)) |
-                  dcc << 19 | detile << 31 | header_dword);
+                  dcc << 19 | detile << 31 | header_dword |
+                  SDMA_5_2_COPY_TILED_SUB_WINDOW_CPV(cpv));
    ac_cmdbuf_emit(tiled->va);
    ac_cmdbuf_emit(tiled->va >> 32);
    ac_cmdbuf_emit(tiled->offset.x | tiled->offset.y << 16);
-   ac_cmdbuf_emit(tiled->offset.z | (tiled->extent.width - 1) << 16);
-   ac_cmdbuf_emit((tiled->extent.height - 1) | (tiled->extent.depth - 1) << 16);
+   if (sdma_ip_version >= SDMA_4_0) {
+      ac_cmdbuf_emit(tiled->offset.z | (tiled->extent.width - 1) << 16);
+      ac_cmdbuf_emit((tiled->extent.height - 1) | (tiled->extent.depth - 1) << 16);
+   } else {
+      ac_cmdbuf_emit(tiled->offset.z | (ac_sdma2_get_pitch_in_tile_max(tiled) - 1) << 16);
+      ac_cmdbuf_emit(ac_sdma2_get_slice_pitch_in_tile_max(tiled) - 1);
+   }
    ac_cmdbuf_emit(info_dword);
    ac_cmdbuf_emit(linear->va);
    ac_cmdbuf_emit(linear->va >> 32);
    ac_cmdbuf_emit(linear->offset.x | linear->offset.y << 16);
    ac_cmdbuf_emit(linear->offset.z | (linear->pitch - 1) << 16);
    ac_cmdbuf_emit(linear->slice_pitch - 1);
-   if (info->sdma_ip_version == SDMA_2_0) {
+   if (sdma_ip_version >= SDMA_2_4) {
+      ac_cmdbuf_emit((width - 1) | (height - 1) << 16);
+      ac_cmdbuf_emit((depth - 1) |
+                     (cpv ? SDMA_5_2_COPY_TILED_SUB_WINDOW_TILED_CP(tiled_cp) |
+                            SDMA_5_2_COPY_TILED_SUB_WINDOW_LINEAR_CP(linear_cp)
+                          : 0));
+   } else {
       ac_cmdbuf_emit(width | (height << 16));
       ac_cmdbuf_emit(depth);
-   } else {
-      ac_cmdbuf_emit((width - 1) | (height - 1) << 16);
-      ac_cmdbuf_emit((depth - 1));
    }
 
    if (dcc) {
-      if (info->sdma_ip_version >= SDMA_7_0) {
+      if (sdma_ip_version >= SDMA_7_0) {
          const struct ac_sdma_surf *src = detile ? tiled : linear;
          const struct ac_sdma_surf *dst = detile ? linear : tiled;
          const uint32_t meta_config = ac_sdma7_get_metadata_config(info, src, dst);
@@ -388,21 +501,25 @@ ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info 
                                  const struct ac_sdma_surf *dst,
                                  uint32_t width, uint32_t height, uint32_t depth)
 {
+   const enum sdma_version sdma_ip_version = info->sdma_ip_version;
+
+   assert(width <= ac_sdma_max_img_extent(sdma_ip_version));
+   assert(height <= ac_sdma_max_img_extent(sdma_ip_version));
+
    const uint32_t src_header_dword =
-      ac_sdma_get_tiled_header_dword(info->sdma_ip_version, src);
+      ac_sdma_get_tiled_header_dword(sdma_ip_version, src);
    const uint32_t src_info_dword = ac_sdma_get_tiled_info_dword(info, src);
    const uint32_t dst_info_dword = ac_sdma_get_tiled_info_dword(info, dst);
-
-   /* Sanity checks. */
-   assert(info->sdma_ip_version >= SDMA_4_0);
+   uint32_t src_cp = 0, dst_cp = 0;
+   bool cpv = false;
 
    /* On GFX10+ this supports DCC, but cannot copy a compressed surface to another compressed surface. */
    assert(!src->is_compressed || !dst->is_compressed);
 
-   if (info->sdma_ip_version >= SDMA_4_0 && info->sdma_ip_version < SDMA_5_0) {
-      /* SDMA v4 doesn't support mip_id selection in the T2T copy packet. */
+   if (sdma_ip_version < SDMA_5_0) {
+      /* SDMA v2-v4 doesn't support mip_id selection in the T2T copy packet. */
       assert(src_header_dword >> 24 == 0);
-      /* SDMA v4 doesn't support any image metadata. */
+      /* SDMA v2-v4 doesn't support any image metadata. */
       assert(!src->is_compressed);
       assert(!dst->is_compressed);
    }
@@ -414,26 +531,70 @@ ac_emit_sdma_copy_t2t_sub_window(struct ac_cmdbuf *cs, const struct radeon_info 
    /* 0 = compress (src is uncompressed), 1 = decompress (src is compressed). */
    const uint32_t dcc_dir = src->is_compressed && !dst->is_compressed;
 
+   if (info->sdma_ip_version == SDMA_5_2) {
+      src_cp = SDMA_5_2_CP_LLC_NOALLOC;
+      dst_cp = SDMA_5_2_CP_LLC_NOALLOC;
+      cpv = true;
+
+      /* SDMA 5.2 (GFX10.3) seems to have a cache coherency issue with GL2 and
+       * DCC which causes random corruption. Overwrite the default cache
+       * policy and force NOA for writes and LRU for reads which seems the
+       * only combination to workaround it.
+       */
+      if (dcc) {
+         src_cp |= SDMA_5_2_CP_GL2_LRU;
+         dst_cp |= SDMA_5_2_CP_GL2_NOA;
+      } else {
+         /* Use the default cache policy. */
+         src_cp |= SDMA_5_2_CP_GL2_NOA;
+         dst_cp |= SDMA_5_2_CP_GL2_BYPASS;
+      }
+   }
+
    ac_cmdbuf_begin(cs);
    ac_cmdbuf_emit(SDMA_PACKET(SDMA_OPCODE_COPY, SDMA_COPY_SUB_OPCODE_T2T_SUB_WINDOW, 0) |
-                  dcc << 19 | dcc_dir << 31 | src_header_dword);
+                  dcc << 19 | dcc_dir << 31 | src_header_dword |
+                  SDMA_5_2_COPY_T2T_SUB_WINDOW_CPV(cpv));
    ac_cmdbuf_emit(src->va);
    ac_cmdbuf_emit(src->va >> 32);
    ac_cmdbuf_emit(src->offset.x | src->offset.y << 16);
-   ac_cmdbuf_emit(src->offset.z | (src->extent.width - 1) << 16);
-   ac_cmdbuf_emit((src->extent.height - 1) | (src->extent.depth - 1) << 16);
+   if (sdma_ip_version >= SDMA_4_0) {
+      ac_cmdbuf_emit(src->offset.z | (src->extent.width - 1) << 16);
+      ac_cmdbuf_emit((src->extent.height - 1) | (src->extent.depth - 1) << 16);
+   } else {
+      ac_cmdbuf_emit(src->offset.z | (ac_sdma2_get_pitch_in_tile_max(src) - 1) << 16);
+      ac_cmdbuf_emit(ac_sdma2_get_slice_pitch_in_tile_max(src) - 1);
+   }
    ac_cmdbuf_emit(src_info_dword);
    ac_cmdbuf_emit(dst->va);
    ac_cmdbuf_emit(dst->va >> 32);
    ac_cmdbuf_emit(dst->offset.x | dst->offset.y << 16);
-   ac_cmdbuf_emit(dst->offset.z | (dst->extent.width - 1) << 16);
-   ac_cmdbuf_emit((dst->extent.height - 1) | (dst->extent.depth - 1) << 16);
+   if (sdma_ip_version >= SDMA_4_0) {
+      ac_cmdbuf_emit(dst->offset.z | (dst->extent.width - 1) << 16);
+      ac_cmdbuf_emit((dst->extent.height - 1) | (dst->extent.depth - 1) << 16);
+   } else {
+      ac_cmdbuf_emit(dst->offset.z | (ac_sdma2_get_pitch_in_tile_max(dst) - 1) << 16);
+      ac_cmdbuf_emit(ac_sdma2_get_slice_pitch_in_tile_max(dst) - 1);
+   }
    ac_cmdbuf_emit(dst_info_dword);
-   ac_cmdbuf_emit((width - 1) | (height - 1) << 16);
-   ac_cmdbuf_emit((depth - 1));
+
+   if (sdma_ip_version >= SDMA_4_0)
+      ac_cmdbuf_emit((width - 1) | (height - 1) << 16);
+   else if (sdma_ip_version >= SDMA_2_4)
+      ac_cmdbuf_emit((width - 8) | ((height - 8) << 16));
+   else
+      ac_cmdbuf_emit(width | height << 16);
+
+   if (sdma_ip_version >= SDMA_2_4)
+      ac_cmdbuf_emit((depth - 1) |
+                     (cpv ? SDMA_5_2_COPY_T2T_SUB_WINDOW_SRC_CP(src_cp) |
+                           SDMA_5_2_COPY_T2T_SUB_WINDOW_DST_CP(dst_cp)
+                        : 0));
+   else
+      ac_cmdbuf_emit(depth);
 
    if (dcc) {
-      if (info->sdma_ip_version >= SDMA_7_0) {
+      if (sdma_ip_version >= SDMA_7_0) {
          const uint32_t meta_config = ac_sdma7_get_metadata_config(info, src, dst);
 
          ac_cmdbuf_emit(meta_config);

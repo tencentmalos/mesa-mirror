@@ -36,6 +36,48 @@ static void radv_query_shader(struct radv_cmd_buffer *cmd_buffer, VkQueryType qu
                               uint32_t src_stride, uint32_t dst_stride, uint32_t count, uint32_t flags,
                               uint32_t pipeline_stats_mask, uint32_t avail_offset, bool uses_emulated_queries);
 
+static enum ac_barrier_flags
+get_query_flush_bits(struct radv_cmd_buffer *cmd_buffer, VkQueryType query_type)
+{
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+
+   /* Only BOTTOM_OF_PIPE barriers wait for EOP event writes.
+    * (with the possible exception of SAMPLE_STREAMOUTSTATS).
+    */
+   switch (query_type) {
+   case VK_QUERY_TYPE_OCCLUSION:
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+   case VK_QUERY_TYPE_TIMESTAMP:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
+      return AC_BARRIER_SYNC_BOTTOM_OF_PIPE;
+
+   /* SAMPLE_STREAMOUTSTATS and shader emulation only need to wait for pre-rasterization shaders.
+    * (if SAMPLE_STREAMOUTSTATS starts failing, use RADV_CMD_FLAG_SYNC_BOTTOM_OF_PIPE)
+    */
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+      return AC_BARRIER_SYNC_VS;
+
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      /* On GFX10.3, we use shader atomics to emulate the query. */
+      return pdev->info.gfx_level >= GFX11 ? AC_BARRIER_SYNC_BOTTOM_OF_PIPE : AC_BARRIER_SYNC_VS;
+
+   /* Performance queries wait for idle in EndQuery. */
+   case VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR:
+   /* Video queries don't use barrier bits. */
+   case VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR:
+   case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR:
+      return 0;
+
+   default:
+      UNREACHABLE("ending unhandled query type");
+   }
+}
+
 static void
 gfx10_copy_shader_query(struct radv_cmd_stream *cs, uint32_t src_sel, uint64_t src_va, uint64_t dst_va)
 {
@@ -45,11 +87,22 @@ gfx10_copy_shader_query(struct radv_cmd_stream *cs, uint32_t src_sel, uint64_t s
 static void
 gfx10_copy_shader_query_gfx(struct radv_cmd_buffer *cmd_buffer, bool use_gds, uint32_t src_offset, uint64_t dst_va)
 {
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    uint32_t src_sel;
    uint64_t src_va;
 
-   /* Make sure GE and/or GDS is idle before copying the value. */
-   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2;
+   /* Wait for shaders that update query counters via atomics to finish. */
+   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_VS;
+
+   if (pdev->info.cp_sdma_ge_use_system_memory_scope) {
+      /* GFX12 doesn't have GDS. */
+      assert(!use_gds);
+
+      /* Flush shader atomics to memory for COPY_DATA src. */
+      cmd_buffer->state.flush_bits |= AC_BARRIER_WB_L2;
+   }
+
    radv_emit_cache_flush(cmd_buffer, false);
 
    if (use_gds) {
@@ -66,8 +119,14 @@ gfx10_copy_shader_query_gfx(struct radv_cmd_buffer *cmd_buffer, bool use_gds, ui
 static void
 gfx10_copy_shader_query_ace(struct radv_cmd_buffer *cmd_buffer, uint32_t src_offset, uint64_t dst_va)
 {
-   /* Make sure GDS is idle before copying the value. */
-   cmd_buffer->gang.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2;
+   ASSERTED const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   ASSERTED const struct radv_physical_device *pdev = radv_device_physical(device);
+
+   /* Handling other generations in this function may require updating the flush flags. */
+   assert(pdev->info.gfx_level == GFX10_3);
+
+   /* Wait for shaders that update query counters via atomics to finish. */
+   cmd_buffer->gang.flush_bits |= AC_BARRIER_SYNC_CS;
    radv_gang_cache_flush(cmd_buffer);
 
    gfx10_copy_shader_query(cmd_buffer->gang.cs, COPY_DATA_GDS, src_offset, dst_va);
@@ -379,7 +438,7 @@ radv_copy_occlusion_query_result(struct radv_cmd_buffer *cmd_buffer, struct radv
             radeon_check_space(device->ws, cs->b, 7);
 
             /* Waits on the upper word of the last DB entry */
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va, 0x80000000, 0xffffffff);
+            ac_emit_cp_wait_mem(cs->b, src_va, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
          }
       }
    }
@@ -600,11 +659,11 @@ radv_update_hw_pipelinestat(struct radv_cmd_buffer *cmd_buffer)
    const uint32_t num_pipeline_stat_queries = radv_get_num_pipeline_stat_queries(cmd_buffer);
 
    if (num_pipeline_stat_queries == 0) {
-      cmd_buffer->state.flush_bits &= ~RADV_CMD_FLAG_START_PIPELINE_STATS;
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_STOP_PIPELINE_STATS;
+      cmd_buffer->state.flush_bits &= ~AC_BARRIER_PIPELINESTAT_START;
+      cmd_buffer->state.flush_bits |= AC_BARRIER_PIPELINESTAT_STOP;
    } else if (num_pipeline_stat_queries == 1) {
-      cmd_buffer->state.flush_bits &= ~RADV_CMD_FLAG_STOP_PIPELINE_STATS;
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_START_PIPELINE_STATS;
+      cmd_buffer->state.flush_bits &= ~AC_BARRIER_PIPELINESTAT_STOP;
+      cmd_buffer->state.flush_bits |= AC_BARRIER_PIPELINESTAT_START;
    }
 }
 
@@ -621,7 +680,7 @@ radv_begin_pipeline_stat_query(struct radv_cmd_buffer *cmd_buffer, struct radv_q
 
    radv_update_hw_pipelinestat(cmd_buffer);
 
-   if (radv_cmd_buffer_uses_mec(cmd_buffer)) {
+   if (cmd_buffer->is_mec) {
       uint32_t cs_invoc_offset =
          radv_get_pipelinestat_query_offset(VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
       va += cs_invoc_offset;
@@ -699,7 +758,7 @@ radv_end_pipeline_stat_query(struct radv_cmd_buffer *cmd_buffer, struct radv_que
 
    va += pipelinestat_block_size;
 
-   if (radv_cmd_buffer_uses_mec(cmd_buffer)) {
+   if (cmd_buffer->is_mec) {
       uint32_t cs_invoc_offset =
          radv_get_pipelinestat_query_offset(VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
       va += cs_invoc_offset;
@@ -753,7 +812,7 @@ radv_end_pipeline_stat_query(struct radv_cmd_buffer *cmd_buffer, struct radv_que
 
    radv_cs_emit_write_event_eop(cs, pdev->info.gfx_level, V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM,
                                 EOP_INT_SEL_SEND_DATA_AFTER_WR_CONFIRM, EOP_DATA_SEL_VALUE_32BIT, avail_va, 1,
-                                cmd_buffer->gfx9_eop_bug_va);
+                                cmd_buffer->eop_bug_va);
 }
 
 static void
@@ -779,7 +838,7 @@ radv_copy_pipeline_stat_query_result(struct radv_cmd_buffer *cmd_buffer, struct 
          uint64_t avail_va = va + pool->availability_offset + 4 * query;
 
          /* This waits on the ME. All copies below are done on the ME */
-         radv_cp_wait_mem(cs, WAIT_REG_MEM_EQUAL, avail_va, 1, 0xffffffff);
+         ac_emit_cp_wait_mem(cs->b, avail_va, 1, 0xffffffff, WAIT_REG_MEM_EQUAL);
 
          if (pool->uses_ace && pdev->emulate_mesh_shader_queries) {
             const uint64_t src_va = va + query * pool->stride;
@@ -788,8 +847,8 @@ radv_copy_pipeline_stat_query_result(struct radv_cmd_buffer *cmd_buffer, struct 
 
             radeon_check_space(device->ws, cs->b, 7 * 2);
 
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, start_va, 0x80000000, 0xffffffff);
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, stop_va, 0x80000000, 0xffffffff);
+            ac_emit_cp_wait_mem(cs->b, start_va, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
+            ac_emit_cp_wait_mem(cs->b, stop_va, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
          }
       }
    }
@@ -1032,7 +1091,7 @@ radv_copy_tfb_query_result(struct radv_cmd_buffer *cmd_buffer, struct radv_query
 
          /* Wait on the upper word of all results. */
          for (unsigned j = 0; j < 4; j++, src_va += 8) {
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 4, 0x80000000, 0xffffffff);
+            ac_emit_cp_wait_mem(cs->b, src_va + 4, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
          }
       }
    }
@@ -1165,7 +1224,7 @@ radv_copy_timestamp_query_result(struct radv_cmd_buffer *cmd_buffer, struct radv
          /* Wait on the high 32 bits of the timestamp in
           * case the low part is 0xffffffff.
           */
-         radv_cp_wait_mem(cs, WAIT_REG_MEM_NOT_EQUAL, local_src_va + 4, TIMESTAMP_NOT_READY >> 32, 0xffffffff);
+         ac_emit_cp_wait_mem(cs->b, local_src_va + 4, TIMESTAMP_NOT_READY >> 32, 0xffffffff, WAIT_REG_MEM_NOT_EQUAL);
       }
    }
 
@@ -1440,12 +1499,12 @@ radv_copy_pg_query_result(struct radv_cmd_buffer *cmd_buffer, struct radv_query_
          radeon_check_space(device->ws, cs->b, 7 * 4);
 
          /* Wait on the upper word of the PrimitiveStorageNeeded result. */
-         radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 4, 0x80000000, 0xffffffff);
-         radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 20, 0x80000000, 0xffffffff);
+         ac_emit_cp_wait_mem(cs->b, src_va + 4, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
+         ac_emit_cp_wait_mem(cs->b, src_va + 20, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
 
          if (uses_emulated_queries) {
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 36, 0x80000000, 0xffffffff);
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 44, 0x80000000, 0xffffffff);
+            ac_emit_cp_wait_mem(cs->b, src_va + 36, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
+            ac_emit_cp_wait_mem(cs->b, src_va + 44, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
          }
       }
    }
@@ -1621,7 +1680,7 @@ radv_end_ms_prim_query(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t
 
       radv_cs_emit_write_event_eop(cs, pdev->info.gfx_level, V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM,
                                    EOP_INT_SEL_SEND_DATA_AFTER_WR_CONFIRM, EOP_DATA_SEL_VALUE_32BIT, avail_va, 1,
-                                   cmd_buffer->gfx9_eop_bug_va);
+                                   cmd_buffer->eop_bug_va);
    } else {
       gfx10_copy_shader_query_gfx(cmd_buffer, true, RADV_SHADER_QUERY_MS_PRIM_GEN_OFFSET, va + 8);
       ac_emit_cp_write_data_imm(cs->b, V_371_MICRO_ENGINE, va + 12, 0x80000000);
@@ -1652,7 +1711,7 @@ radv_copy_ms_prim_query_result(struct radv_cmd_buffer *cmd_buffer, struct radv_q
             uint64_t avail_va = va + pool->availability_offset + 4 * query;
 
             /* This waits on the ME. All copies below are done on the ME */
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_EQUAL, avail_va, 1, 0xffffffff);
+            ac_emit_cp_wait_mem(cs->b, avail_va, 1, 0xffffffff, WAIT_REG_MEM_EQUAL);
          }
       }
 
@@ -1668,8 +1727,8 @@ radv_copy_ms_prim_query_result(struct radv_cmd_buffer *cmd_buffer, struct radv_q
             radeon_check_space(device->ws, cs->b, 7 * 2);
 
             /* Wait on the upper word. */
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 4, 0x80000000, 0xffffffff);
-            radv_cp_wait_mem(cs, WAIT_REG_MEM_GREATER_OR_EQUAL, src_va + 12, 0x80000000, 0xffffffff);
+            ac_emit_cp_wait_mem(cs->b, src_va + 4, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
+            ac_emit_cp_wait_mem(cs->b, src_va + 12, 0x80000000, 0xffffffff, WAIT_REG_MEM_GREATER_OR_EQUAL);
          }
       }
 
@@ -1786,6 +1845,7 @@ radv_query_shader(struct radv_cmd_buffer *cmd_buffer, VkQueryType query_type, st
                   uint32_t flags, uint32_t pipeline_stats_mask, uint32_t avail_offset, bool uses_emulated_queries)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    VkPipelineLayout layout;
    VkPipeline pipeline;
    VkResult result;
@@ -1816,10 +1876,15 @@ radv_query_shader(struct radv_cmd_buffer *cmd_buffer, VkQueryType query_type, st
    radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
                             &push_constants);
 
-   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_INV_VCACHE;
+   /* Make sure VMEM doesn't read stale data. */
+   cmd_buffer->state.flush_bits |= AC_BARRIER_INV_VMEM;
 
    if (flags & VK_QUERY_RESULT_WAIT_BIT)
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLUSH_AND_INV_FRAMEBUFFER;
+      cmd_buffer->state.flush_bits |= get_query_flush_bits(cmd_buffer, query_type);
+
+   /* Make EOP event writes visible to the shader if they arrived. */
+   if (pdev->info.gfx_level <= GFX8 || pdev->info.cp_sdma_ge_use_system_memory_scope)
+      cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2;
 
    radv_unaligned_dispatch(cmd_buffer, count, 1, 1);
 
@@ -1827,8 +1892,7 @@ radv_query_shader(struct radv_cmd_buffer *cmd_buffer, VkQueryType query_type, st
     * there is an implicit execution dependency from each such query command to all query commands
     * previously submitted to the same queue.
     */
-   cmd_buffer->active_query_flush_bits |=
-      RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_INV_VCACHE;
+   cmd_buffer->active_query_flush_bits |= AC_BARRIER_SYNC_CS;
 
    radv_meta_end(cmd_buffer);
 }
@@ -1852,6 +1916,9 @@ static void
 radv_reset_query_pool(struct radv_device *device, struct radv_query_pool *pool, uint32_t first_query,
                       uint32_t query_count)
 {
+   if (!pool->bo)
+      return;
+
    const struct radv_physical_device *pdev = radv_device_physical(device);
    uint32_t value = query_clear_value(pool->vk.query_type);
    uint32_t *data = (uint32_t *)(pool->ptr + first_query * pool->stride);
@@ -1873,10 +1940,11 @@ radv_destroy_query_pool(struct radv_device *device, const VkAllocationCallbacks 
    if (pool->vk.query_type == VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR)
       radv_pc_deinit_query_pool((struct radv_pc_query_pool *)pool);
 
-   if (pool->bo)
+   if (pool->bo) {
       radv_bo_destroy(device, &pool->vk.base, pool->bo);
+      radv_rmv_log_resource_destroy(device, (uint64_t)radv_query_pool_to_handle(pool));
+   }
 
-   radv_rmv_log_resource_destroy(device, (uint64_t)radv_query_pool_to_handle(pool));
    vk_query_pool_finish(&pool->vk);
    vk_free2(&device->vk.alloc, pAllocator, pool);
 }
@@ -1970,12 +2038,10 @@ radv_create_query_pool(struct radv_device *device, const VkQueryPoolCreateInfo *
       }
       break;
    case VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR:
-      {
-         const VkVideoProfileInfoKHR *profile = vk_find_struct_const(pCreateInfo->pNext, VIDEO_PROFILE_INFO_KHR);
-         assert(profile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR ||
-                profile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR ||
-                profile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR);
-      }
+      if (pool->vk.video_profile.op != VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR &&
+          pool->vk.video_profile.op != VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR &&
+          pool->vk.video_profile.op != VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR)
+         goto out;
       FALLTHROUGH;
    case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR:
       /* base encode feedback size */
@@ -2022,8 +2088,10 @@ radv_create_query_pool(struct radv_device *device, const VkQueryPoolCreateInfo *
    if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
       radv_reset_query_pool(device, pool, 0, pool->vk.query_count);
 
+out:
    *pQueryPool = radv_query_pool_to_handle(pool);
-   radv_rmv_log_query_pool_create(device, *pQueryPool);
+   if (pool->bo)
+      radv_rmv_log_query_pool_create(device, *pQueryPool);
    return VK_SUCCESS;
 }
 
@@ -2389,6 +2457,15 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
          break;
       }
       case VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR:
+         if (!pool->bo) {
+            /* this is a no-op pool that cannot be used */
+            if (flags & VK_QUERY_RESULT_64_BIT)
+               *(uint64_t *)data = VK_QUERY_RESULT_STATUS_NOT_READY_KHR;
+            else
+               *(uint32_t *)data = VK_QUERY_RESULT_STATUS_NOT_READY_KHR;
+            goto out;
+         }
+      FALLTHROUGH;
       case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR: {
          const bool write_memory =
             pdev->info.video_caps.queue[AMD_IP_VCN_ENC].write_memory == AC_VIDEO_WRITE_MEMORY_SUPPORT_FULL;
@@ -2459,6 +2536,7 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
       }
    }
 
+out:
    if (result == VK_ERROR_DEVICE_LOST)
       vk_device_set_lost(&device->vk, "GetQueryPoolResults timed out");
 
@@ -2568,6 +2646,9 @@ radv_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uin
    uint32_t value = query_clear_value(pool->vk.query_type);
    uint32_t flush_bits = 0;
 
+   if (!pool->bo)
+      return;
+
    if (cmd_buffer->qf == RADV_QUEUE_VIDEO_DEC || cmd_buffer->qf == RADV_QUEUE_VIDEO_ENC)
       /* video queries don't work like this */
       return;
@@ -2581,13 +2662,13 @@ radv_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uin
    radv_meta_begin(cmd_buffer);
 
    flush_bits |= radv_fill_buffer(cmd_buffer, pool->bo, radv_buffer_get_va(pool->bo) + firstQuery * pool->stride,
-                                  queryCount * pool->stride, value);
+                                  queryCount * pool->stride, value, true);
 
    if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS ||
        (pool->vk.query_type == VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT && pdev->info.gfx_level >= GFX11)) {
-      flush_bits |=
-         radv_fill_buffer(cmd_buffer, pool->bo,
-                          radv_buffer_get_va(pool->bo) + pool->availability_offset + firstQuery * 4, queryCount * 4, 0);
+      flush_bits |= radv_fill_buffer(cmd_buffer, pool->bo,
+                                     radv_buffer_get_va(pool->bo) + pool->availability_offset + firstQuery * 4,
+                                     queryCount * 4, 0, true);
    }
 
    radv_meta_end(cmd_buffer);
@@ -2646,9 +2727,6 @@ static void
 emit_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *pool, uint64_t va, uint64_t avail_va,
                VkQueryType query_type, uint32_t index)
 {
-   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   const struct radv_physical_device *pdev = radv_device_physical(device);
-
    switch (query_type) {
    case VK_QUERY_TYPE_OCCLUSION:
       radv_end_occlusion_query(cmd_buffer, va);
@@ -2678,12 +2756,7 @@ emit_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *pool,
       UNREACHABLE("ending unhandled query type");
    }
 
-   cmd_buffer->active_query_flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
-                                          RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 |
-                                          RADV_CMD_FLAG_INV_VCACHE;
-   if (pdev->info.gfx_level >= GFX9) {
-      cmd_buffer->active_query_flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB;
-   }
+   cmd_buffer->active_query_flush_bits |= get_query_flush_bits(cmd_buffer, query_type);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2761,7 +2834,7 @@ radv_write_timestamp(struct radv_cmd_buffer *cmd_buffer, uint64_t va, VkPipeline
    } else {
       radv_cs_emit_write_event_eop(cs, pdev->info.gfx_level, V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM,
                                    EOP_INT_SEL_SEND_DATA_AFTER_WR_CONFIRM, EOP_DATA_SEL_TIMESTAMP, va, 0,
-                                   cmd_buffer->gfx9_eop_bug_va);
+                                   cmd_buffer->eop_bug_va);
    }
 }
 
@@ -2803,7 +2876,7 @@ radv_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 sta
    if (pdev->drirc.debug.flush_before_timestamp_write) {
       /* Make sure previously launched waves have finished */
       cmd_buffer->state.flush_bits |=
-         RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
+         AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS | AC_BARRIER_SYNC_CS;
    }
 
    radv_emit_cache_flush(cmd_buffer, false);
@@ -2815,13 +2888,7 @@ radv_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 sta
       query_va += pool->stride;
    }
 
-   cmd_buffer->active_query_flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
-                                          RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2 |
-                                          RADV_CMD_FLAG_INV_VCACHE;
-   if (pdev->info.gfx_level >= GFX9) {
-      cmd_buffer->active_query_flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB;
-   }
-
+   cmd_buffer->active_query_flush_bits |= get_query_flush_bits(cmd_buffer, VK_QUERY_TYPE_TIMESTAMP);
    assert(cs->b->cdw <= cdw_max);
 }
 

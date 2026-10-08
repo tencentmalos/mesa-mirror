@@ -66,8 +66,8 @@ struct affinity {
     */
    unsigned align     :7;
    unsigned align_offs:7;
-   unsigned nr        :4;
-   unsigned padding   :6;
+   unsigned nr        :8;
+   unsigned padding   :2;
 };
 static_assert(sizeof(struct affinity) == 8, "packed");
 
@@ -702,7 +702,9 @@ pick_regs_from_block(jay_ra_state *ra,
          /* If we are the collect representative but the final collect won't
           * actually be usable, the whole vector will need to be copied.
           */
-         if (i < affinity.offset || !util_is_aligned(i - affinity.offset, 4)) {
+         if (i < affinity.offset ||
+             !util_is_aligned(i - affinity.offset, 4) ||
+             (i - affinity.offset) + affinity.nr >= block.len_gpr) {
             cost += affinity.nr;
          }
       } else if (affinity.repr) {
@@ -787,7 +789,8 @@ pick_regs(jay_ra_state *ra,
    struct affinity affinity =
       ra->phi_web[phi_web_find(ra->phi_web, jay_channel(var, 0))].affinity;
 
-   assert(alignment >= size && "alignment must be a multiple of size");
+   /* The shuffle code relies on size being a multiple of alignment */
+   alignment = MAX2(alignment, size);
 
    /* We select registers roundrobin. This has several benefits:
     *
@@ -854,13 +857,16 @@ pick_regs(jay_ra_state *ra,
     * whole vector if we are the representative. This leaves us registers for
     * the rest of the vector.
     */
-   if (rr->gpr <= best_reg && best_reg <= rr->gpr + 16) {
-      bool is_repr = affinity.repr == jay_channel(var, 0);
-      rr->gpr = best_reg + MAX2(size, is_repr ? affinity.nr : 0);
+   if (file != MEM) {
+      if (rr->gpr <= best_reg && best_reg <= rr->gpr + 16) {
+         bool is_repr = affinity.repr == jay_channel(var, 0);
+         rr->gpr = best_reg +
+                   MAX2(size, is_repr ? (affinity.nr - affinity.offset) : 0);
 
-      if (rr->gpr >= partition->blocks[file][rr->block].len_gpr) {
-         rr->block = ((rr->block + 1) == nr_blocks) ? 0 : (rr->block + 1);
-         rr->gpr = 0;
+         if (rr->gpr >= partition->blocks[file][rr->block].len_gpr) {
+            rr->block = ((rr->block + 1) == nr_blocks) ? 0 : (rr->block + 1);
+            rr->gpr = 0;
+         }
       }
    }
 
@@ -954,11 +960,10 @@ assign_regs_for_inst(jay_ra_state *ra, jay_inst *I)
       bool killed = false;
       jay_def var = *(vars[i]);
       unsigned size = jay_num_values(var);
-      unsigned alignment =
-         I->op == JAY_OPCODE_EXPAND_QUAD ||
-               (I->op == JAY_OPCODE_VECTOR_EXTRACT && is_src) ?
-            1 :
-            util_next_power_of_two(size);
+      unsigned alignment = I->op == JAY_OPCODE_EXPAND_QUAD ||
+                                 (I->op == JAY_OPCODE_SHUFFLE && is_src) ?
+                              1 :
+                              util_next_power_of_two(size);
       enum jay_file file = var.file;
       enum jay_stride min_stride = JAY_STRIDE_2, max_stride = JAY_STRIDE_8;
 
@@ -1371,7 +1376,7 @@ jay_register_allocate_function(jay_function *f)
 
             ra.affinities[index].repr = repr;
             ra.affinities[index].offset = repr == index ? c : c - repr_c;
-            ra.affinities[index].nr = MIN2(jay_num_values(I->src[s]), 15);
+            ra.affinities[index].nr = MIN2(jay_num_values(I->src[s]), 255);
          }
 
          if (jay_is_early_eot_send(shader, I) && I->src[s].file != FLAG) {

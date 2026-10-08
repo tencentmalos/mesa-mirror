@@ -291,31 +291,39 @@ enum tc_binding_type {
    TC_BINDING_UBO_TCS,
    TC_BINDING_UBO_TES,
    TC_BINDING_UBO_CS,
+   TC_BINDING_UBO_TASK,
+   TC_BINDING_UBO_MESH,
    TC_BINDING_SAMPLERVIEW_VS,
    TC_BINDING_SAMPLERVIEW_FS,
    TC_BINDING_SAMPLERVIEW_GS,
    TC_BINDING_SAMPLERVIEW_TCS,
    TC_BINDING_SAMPLERVIEW_TES,
    TC_BINDING_SAMPLERVIEW_CS,
+   TC_BINDING_SAMPLERVIEW_TASK,
+   TC_BINDING_SAMPLERVIEW_MESH,
    TC_BINDING_SSBO_VS,
    TC_BINDING_SSBO_FS,
    TC_BINDING_SSBO_GS,
    TC_BINDING_SSBO_TCS,
    TC_BINDING_SSBO_TES,
    TC_BINDING_SSBO_CS,
+   TC_BINDING_SSBO_TASK,
+   TC_BINDING_SSBO_MESH,
    TC_BINDING_IMAGE_VS,
    TC_BINDING_IMAGE_FS,
    TC_BINDING_IMAGE_GS,
    TC_BINDING_IMAGE_TCS,
    TC_BINDING_IMAGE_TES,
    TC_BINDING_IMAGE_CS,
+   TC_BINDING_IMAGE_TASK,
+   TC_BINDING_IMAGE_MESH,
 };
 
 typedef void (*tc_replace_buffer_storage_func)(struct pipe_context *ctx,
                                                struct pipe_resource *dst,
                                                struct pipe_resource *src,
                                                unsigned minimum_num_rebinds,
-                                               uint32_t rebind_mask,
+                                               uint64_t rebind_mask,
                                                uint32_t delete_buffer_id);
 typedef struct pipe_fence_handle *(*tc_create_fence_func)(struct pipe_context *ctx,
                                                           struct tc_unflushed_batch_token *token);
@@ -585,6 +593,7 @@ struct threaded_context_options {
 
 struct tc_vertex_buffers {
    struct tc_call_base base;
+   bool merge_with_draw;
    uint8_t count;
    struct pipe_vertex_buffer slot[0]; /* more will be allocated if needed */
 };
@@ -652,6 +661,7 @@ struct threaded_context {
    bool seen_shader_buffers[MESA_SHADER_MESH_STAGES];
    bool seen_image_buffers[MESA_SHADER_MESH_STAGES];
    bool seen_sampler_buffers[MESA_SHADER_MESH_STAGES];
+   bool pending_vbs_seen_draws;
 
    int8_t last_completed;
    int8_t batch_generation;
@@ -689,6 +699,8 @@ struct threaded_context {
    uint64_t image_buffers_writeable_mask[MESA_SHADER_MESH_STAGES];
    uint32_t sampler_buffers[MESA_SHADER_MESH_STAGES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
 
+   struct tc_vertex_buffers *pending_vbs; //for enqueue
+
    struct tc_batch batch_slots[TC_MAX_BATCHES];
    struct tc_buffer_list buffer_lists[TC_MAX_BUFFER_LISTS];
    /* the current framebuffer attachments; [PIPE_MAX_COLOR_BUFS] is the zsbuf */
@@ -696,10 +708,12 @@ struct threaded_context {
    struct pipe_resource *fb_resolve;
    /* accessed by main thread; preserves info across batches */
    struct tc_renderpass_info *renderpass_info_recording;
-   /* accessed by driver thread */
-   struct tc_renderpass_info *renderpass_info;
    /* internal-only: if dsa/fs are bound between render passes */
    void *pending_renderpass_dsa, *pending_renderpass_fs;
+
+   /* accessed by driver thread */
+   alignas(MESA_CACHE_LINE_SIZE) struct tc_renderpass_info *renderpass_info;
+   struct tc_vertex_buffers *deferred_vbs; //for exec
 };
 
 

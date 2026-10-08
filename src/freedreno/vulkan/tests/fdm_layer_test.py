@@ -51,20 +51,31 @@ int main() {
    tu_frag_area area{};
    expected_pixel = bytes+128+2*3+64*5;
    for (unsigned layer : {0u,1u,7u}) {
-      tu_fragment_density_map_sample(&view,96,160,256,256,layer,&area);
+      tu_fragment_density_map_sample(&view,nullptr,96,160,256,256,layer,&area);
       assert(area.width==1 && area.height==1);
    }
    view.vk.layer_count=2;
    for (unsigned layer : {0u,1u}) {
       expected_pixel=bytes+128+4096*layer+2*3+64*5;
-      tu_fragment_density_map_sample(&view,96,160,256,256,layer,&area);
+      tu_fragment_density_map_sample(&view,nullptr,96,160,256,256,layer,&area);
       assert(area.width==1 && area.height==1);
    }
    view.vk.layer_count=1;
    expected_pixel=bytes+128;
-   tu_fragment_density_map_sample(&view,-4,-4,256,256,1,&area);
-   assert(reads==6);
-   puts("6 production FDM sampling checks passed");
+   tu_fragment_density_map_sample(&view,nullptr,-4,-4,256,256,1,&area);
+   for (unsigned layer : {0u,1u,7u}) {
+      expected_pixel=bytes+16*5+2*3;
+      tu_fragment_density_map_sample(&view,bytes,96,160,256,256,layer,&area);
+      assert(area.width==1 && area.height==1);
+   }
+   view.vk.layer_count=2;
+   for (unsigned layer : {0u,1u}) {
+      expected_pixel=bytes+16*(8*layer+5)+2*3;
+      tu_fragment_density_map_sample(&view,bytes,96,160,256,256,layer,&area);
+      assert(area.width==1 && area.height==1);
+   }
+   assert(reads==11);
+   puts("11 production FDM sampling checks passed");
 }
 '''
 with tempfile.TemporaryDirectory() as directory:

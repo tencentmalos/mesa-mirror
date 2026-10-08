@@ -37,7 +37,6 @@
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 #include "util/format/u_formats.h"
-#include "pipe/p_shader_tokens.h"
 #include "pipe/p_state.h"
 #include "util/macros.h"
 #include "util/slab.h"
@@ -117,6 +116,11 @@ struct etna_streamout {
    unsigned num_descriptors;
    uint32_t TFB_DESCRIPTOR_COUNT[VIVS_TFB_DESCRIPTOR_COUNT__LEN];
    uint32_t TFB_DESCRIPTOR[VIVS_TFB_DESCRIPTOR__LEN];
+
+   /* software XFB emulation */
+   uint32_t captured_bytes[PIPE_MAX_SO_BUFFERS];
+   uint32_t num_vertices;
+   uint32_t first_vertex;
 };
 
 enum etna_uniform_contents {
@@ -132,6 +136,10 @@ enum etna_uniform_contents {
    ETNA_UNIFORM_SAMPLER_LOD_MAX,
    ETNA_UNIFORM_SAMPLER_LOD_BIAS,
    ETNA_UNIFORM_UBO_ADDR,
+   ETNA_UNIFORM_CONSTANT_DATA_ADDR,
+   ETNA_UNIFORM_XFB_ADDR,
+   ETNA_UNIFORM_XFB_NUM_VERTICES,
+   ETNA_UNIFORM_XFB_FIRST_VERTEX,
 };
 
 struct etna_shader_uniform_info {
@@ -144,6 +152,7 @@ struct etna_framebuffer_state {
    struct pipe_framebuffer_state base;
 
    unsigned rt_is_128bit : ETNA_MAX_128BIT_RTS;
+   unsigned rt_pack_rgba16 : PIPE_MAX_COLOR_BUFS;
    unsigned rt_companion[ETNA_MAX_128BIT_RTS];
    int8_t companion_src[PIPE_MAX_COLOR_BUFS];
    uint32_t rt_ts_mask;
@@ -220,6 +229,7 @@ struct etna_context {
    unsigned num_fragment_sampler_views;
    uint32_t active_sampler_views;
    uint32_t dirty_sampler_views;
+   uint32_t border_shadow_views;
    uint32_t dirty_samplers;
    struct pipe_sampler_view *sampler_view[PIPE_MAX_SAMPLERS];
    struct etna_constbuf_state constant_buffer[MESA_SHADER_STAGES];
@@ -236,6 +246,7 @@ struct etna_context {
    /* stats/counters */
    struct {
       uint64_t prims_generated;
+      uint64_t prims_emitted;
       uint64_t draw_calls;
       uint64_t rs_operations;
       uint64_t flushes;
@@ -265,6 +276,7 @@ struct etna_context {
     * pipe_blit_info has no driver-private field to carry this through. */
    bool blit_rb_swap;
    bool needs_gpu_state_reset;
+   bool mag_switchover_half;
    bool alpha_coverage_dither_emitted;
 
    /* conditional rendering */
@@ -294,6 +306,12 @@ static inline bool
 etna_framebuffer_rt_use_ts(const struct etna_context *ctx, unsigned i)
 {
    return ctx->framebuffer_s.rt_ts_mask & BITFIELD_BIT(i);
+}
+
+static inline bool
+etna_sampler_view_uses_border_shadow(const struct etna_context *ctx, unsigned num)
+{
+   return ctx->border_shadow_views & (1u << num);
 }
 
 struct pipe_context *

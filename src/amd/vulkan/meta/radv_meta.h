@@ -28,6 +28,31 @@
 extern "C" {
 #endif
 
+enum radv_buffer_meta_path {
+   RADV_BUFFER_META_PATH_CP_DMA = -1,
+   RADV_BUFFER_META_PATH_AUTO = 0,
+
+   /* This forces the compute shader path and selects the number of dwords that each compute shader
+    * invocation fills or copies.
+    */
+   RADV_BUFFER_META_PATH_COMPUTE_1DW = 1,
+   RADV_BUFFER_META_PATH_COMPUTE_2DW = 2,
+   RADV_BUFFER_META_PATH_COMPUTE_4DW = 4,
+};
+
+static inline bool
+radv_buffer_meta_path_forces_compute(enum radv_buffer_meta_path path)
+{
+   return path >= RADV_BUFFER_META_PATH_COMPUTE_1DW;
+}
+
+static inline unsigned
+radv_buffer_meta_path_get_dwords_per_thread(enum radv_buffer_meta_path path)
+{
+   assert(path == RADV_BUFFER_META_PATH_CP_DMA || util_is_power_of_two_or_zero(path));
+   return MAX2(path, 0);
+}
+
 /* Codepath selection for framebuffer clears, image clears, copies, blits, and MSAA resolves.
  * It has no effect on transfer queues. Compute queues ignore the fragment option.
  */
@@ -66,8 +91,7 @@ enum radv_meta_object_key_type {
    RADV_META_OBJECT_KEY_BLIT2D_DEPTH,
    RADV_META_OBJECT_KEY_BLIT2D_STENCIL,
    RADV_META_OBJECT_KEY_BLIT2D_DEPTH_STENCIL,
-   RADV_META_OBJECT_KEY_FILL_MEMORY,
-   RADV_META_OBJECT_KEY_COPY_MEMORY,
+   RADV_META_OBJECT_KEY_FILL_OR_COPY_MEMORY,
    RADV_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER,
    RADV_META_OBJECT_KEY_COPY_BUFFER_TO_IMAGE,
    RADV_META_OBJECT_KEY_COPY_IMAGE,
@@ -356,10 +380,10 @@ void radv_meta_decode_astc(struct radv_cmd_buffer *cmd_buffer, struct radv_image
                            const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent);
 
 uint32_t radv_fill_buffer(struct radv_cmd_buffer *cmd_buffer, struct radeon_winsys_bo *bo, uint64_t va, uint64_t size,
-                          uint32_t value);
+                          uint32_t value, bool cp_coherent);
 
 uint32_t radv_fill_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t size, uint32_t value,
-                          VkAddressCopyFlagsKHR copy_flags);
+                          VkAddressCopyFlagsKHR copy_flags, bool cp_coherent);
 
 uint32_t radv_fill_image(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *image, uint64_t offset,
                          uint64_t size, uint32_t value);
