@@ -391,12 +391,8 @@ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
       tu_emit_event_write<CHIP>(cmd_buffer, cs, FD_CACHE_CLEAN);
    if (flushes & TU_CMD_FLAG_CACHE_INVALIDATE)
       tu_emit_event_write<CHIP>(cmd_buffer, cs, FD_CACHE_INVALIDATE);
-   if (flushes & TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE) {
-      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
-            .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
-            .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,
-      ));
-   }
+   if (flushes & TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE)
+      tu_emit_bindless_invalidate<CHIP>(cs, true, true);
 
    /* SUBPASS_SLICE_FENCE is a weaker version of:
     * - CACHE_INVALIDATE (only invalidate UCHE GMEM aperture)
@@ -2503,6 +2499,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
          .gfx_shared_const = true,
          .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
          .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,));
+   if (CHIP >= A8XX)
+      tu_emit_bindless_invalidate<CHIP>(cs, true, true);
 
    tu_cs_emit_wfi(cs);
 
@@ -4834,10 +4832,7 @@ tu6_emit_bindless_bases(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       }
    }
 
-   tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
-      .cs_bindless = compute ? CHIP == A6XX ? 0x1f : 0xff : 0,
-      .gfx_bindless = !compute ? CHIP == A6XX ? 0x1f : 0xff : 0,
-   ));
+   tu_emit_bindless_invalidate<CHIP>(cs, !compute, compute);
 }
 
 template <chip CHIP>
@@ -10493,7 +10488,8 @@ tu_mesh_emit_ms_chunks(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       return;
    }
 
-   for (uint32_t i = 0; i < TU_MESH_MAX_CHUNKS; i++) {
+   assert(count <= TU_MESH_MAX_CHUNKS);
+   for (uint32_t i = 0; i < count; i++) {
       uint64_t args = tu_mesh_chunk_args(cmd, TU_MESH_MS_TABLE_OFFSET, i);
       tu_mesh_begin_chunk_cond<CHIP>(cs, args, TU_PREDICATE_MESH);
       tu_mesh_emit_chunk<CHIP>(cmd, cs, ms, i * chunk, 0, args);
@@ -10526,7 +10522,7 @@ tu_mesh_emit_task_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       .chunks = TU_MESH_MAX_CHUNKS,
    };
    tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
-   tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, 0);
+   tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, setup.chunks);
 }
 
 template <chip CHIP>
@@ -10564,15 +10560,19 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
          tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, false, count);
       }
    } else {
+      uint32_t table_entries = ts ? TU_MESH_TABLE_MAX_ENTRIES : 1;
+      uint32_t mesh_chunks = DIV_ROUND_UP(TU_MESH_MAX_WORKGROUPS,
+                                         ms->mesh.chunk_workgroups);
+      assert(mesh_chunks <= TU_MESH_MAX_CHUNKS);
       for (uint32_t first = 0; first < draw->draw_count;
-           first += TU_MESH_TABLE_MAX_ENTRIES) {
+           first += table_entries) {
          struct tu_mesh_setup setup = {
             .table = ts ? TU_MESH_TS_TABLE_OFFSET : TU_MESH_MS_TABLE_OFFSET,
             .source = TU_MESH_SOURCE_INDIRECT,
             .src = draw->indirect,
             .stride = draw->stride,
             .max_count = MIN2(draw->draw_count - first,
-                              TU_MESH_TABLE_MAX_ENTRIES),
+                              table_entries),
             .count = draw->draw_count,
             .count_iova = draw->count,
             .first = first,
@@ -10580,12 +10580,12 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
                         : ms->mesh.chunk_workgroups,
             .vertices = ts ? 0 : (uint32_t) ms->mesh.max_primitives *
                                  ms->mesh.verts_per_prim,
-            .chunks = ts ? TU_MESH_MAX_TASK_CHUNKS : TU_MESH_MAX_CHUNKS,
+            .chunks = ts ? TU_MESH_MAX_TASK_CHUNKS : mesh_chunks,
          };
          tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
 
          if (!ts) {
-            tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, 0);
+            tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, mesh_chunks);
             continue;
          }
 

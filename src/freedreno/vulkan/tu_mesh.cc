@@ -964,16 +964,20 @@ tu_mesh_build_setup_cs(const nir_shader_compiler_options *options)
    }
    nir_pop_if(b, NULL);
 
-   nir_push_if(b, nir_ult(b, t, s.params[TU_MESH_PARAM_CHUNKS]));
+   nir_variable *arg_index = nir_local_variable_create(b->impl, glsl_uint_type(), "arg_index");
+   nir_store_var(b, arg_index, t, 0x1);
+   nir_loop *arg_loop = nir_push_loop(b);
    {
+      nir_def *index = nir_load_var(b, arg_index);
+      nir_break_if(b, nir_uge(b, index, s.params[TU_MESH_PARAM_CHUNKS]));
       nir_def *chunk = s.params[TU_MESH_PARAM_CHUNK];
-      nir_def *base = nir_imul(b, t, chunk);
+      nir_def *base = nir_imul(b, index, chunk);
       nir_def *left = nir_bcsel(b, nir_ult(b, base, total),
                                 nir_isub(b, total, base), nir_imm_int(b, 0));
       nir_def *groups = nir_umin(b, left, chunk);
       nir_def *args =
          addr_add(b, s.table,
-                  nir_iadd_imm(b, nir_imul_imm(b, t, TU_MESH_ARGS_SIZE),
+                  nir_iadd_imm(b, nir_imul_imm(b, index, TU_MESH_ARGS_SIZE),
                                TU_MESH_TABLE_ARGS));
       nir_store_global(b, nir_vec4(b, groups, nir_imm_int(b, 1), nir_imm_int(b, 1),
                                    nir_b2i32(b, nir_ine_imm(b, groups, 0))),
@@ -984,8 +988,9 @@ tu_mesh_build_setup_cs(const nir_shader_compiler_options *options)
                                    nir_imm_int(b, 0)),
                        addr_add(b, args, nir_imm_int(b, TU_MESH_ARG_DRAW)),
                        .align_mul = 16);
+      nir_store_var(b, arg_index, nir_iadd_imm(b, index, TU_MESH_SETUP_WORKGROUP_SIZE), 0x1);
    }
-   nir_pop_if(b, NULL);
+   nir_pop_loop(b, arg_loop);
 
    NIR_PASS(_, b->shader, nir_lower_vars_to_ssa);
    return b->shader;

@@ -207,6 +207,7 @@ static bool
 tu_has_mesh_shader(const struct tu_physical_device *device)
 {
    return debug_get_bool_option("TU_EXPERIMENTAL_MESH", false) &&
+          !device->instance->drirc.misc.emulate_second_queue &&
           device->info->chip == 8 &&
           device->info->cs_shared_mem_size >= 32 * 1024;
 }
@@ -1490,7 +1491,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxTaskPayloadSize = 16384;
    props->maxTaskSharedMemorySize = 32768;
    props->maxTaskPayloadAndSharedMemorySize = 32768;
-   props->maxMeshWorkGroupTotalCount = 1u << 22;
+   props->maxMeshWorkGroupTotalCount = TU_MESH_MAX_WORKGROUPS;
    props->maxMeshWorkGroupCount[0] = 65535;
    props->maxMeshWorkGroupCount[1] = 65535;
    props->maxMeshWorkGroupCount[2] = 65535;

@@ -941,6 +941,23 @@ void tu6_emit_blit_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
 void tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs);
 
+template <chip CHIP>
+static inline void
+tu_emit_bindless_invalidate(struct tu_cs *cs, bool gfx, bool compute)
+{
+   if (CHIP >= A8XX) {
+      if (gfx)
+         tu_cs_emit_regs(cs, A6XX_SP_GFX_BINDLESS_INVALIDATE(.dword = 1));
+      if (compute)
+         tu_cs_emit_regs(cs, A6XX_SP_CS_BINDLESS_INVALIDATE(.dword = 1));
+   } else {
+      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+         .cs_bindless = compute ? CHIP == A6XX ? 0x1f : 0xff : 0,
+         .gfx_bindless = gfx ? CHIP == A6XX ? 0x1f : 0xff : 0,
+      ));
+   }
+}
+
 void tu6_apply_depth_bounds_workaround(struct tu_device *device,
                                        uint32_t *rb_depth_cntl);
 
