@@ -21,6 +21,7 @@
 #include "tu_buffer.h"
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
+#include "tu_deferred.h"
 #include "tu_event.h"
 #include "tu_image.h"
 #include "tu_knl.h"
@@ -1622,6 +1623,7 @@ tu6_emit_tile_select(struct tu_cmd_buffer *cmd,
    }
 
    bool bin_scale_en =
+      CHIP < A8XX &&
       cmd->device->physical_device->info->props.has_hw_bin_scaling &&
       layers <= MAX_HW_SCALED_VIEWS && !cmd->state.rp.shared_viewport &&
       bin_is_scaled;
@@ -3469,6 +3471,9 @@ tu7_emit_concurrent_binning_gmem(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       cmd->state.rp.has_vtx_stats_query_in_rp ||
       cmd->state.prim_counters_running > 0;
 
+   disable_cb |= tu7_cb_disable_reason(cmd->fdm_bin_patchpoints.size != 0,
+                                       cmd, "FDM patchpoints");
+
    tu7_cb_disable_reason(disable_cb, cmd,
       "xfb/prim-gen/prim-counters/vtx-stats query is running");
    tu7_cb_disable_reason(!use_hw_binning, cmd, "hw binning disabled");
@@ -4254,6 +4259,8 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    }
 
    cmd_buffer->device = device;
+   if (device->vk.enabled_features.fragmentDensityMapDeferred)
+      vk_cmd_queue_init(&cmd_buffer->vk.cmd_queue);
 
    u_trace_init(&cmd_buffer->trace, &device->trace_context);
    u_trace_init(&cmd_buffer->rp_trace, &device->trace_context);
@@ -4357,6 +4364,7 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd_buffer->vis_stream_bos);
    util_dynarray_fini(&cmd_buffer->vis_stream_cs_bos);
 
+   ralloc_free(cmd_buffer->fdm_snapshots_ctx);
    vk_command_buffer_finish(&cmd_buffer->vk);
    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer);
 }
@@ -4373,6 +4381,12 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       status_check_result = tu_cmd_buffer_status_check_idle(cmd_buffer);
 
     vk_command_buffer_reset(&cmd_buffer->vk);
+    ralloc_free(cmd_buffer->fdm_snapshots_ctx);
+    cmd_buffer->fdm_snapshots_ctx = nullptr;
+    cmd_buffer->fdm_snapshots = cmd_buffer->fdm_snapshots_tail = nullptr;
+    cmd_buffer->fdm_host_snapshot = nullptr;
+    cmd_buffer->deferred_recording = false;
+    cmd_buffer->deferred_replaying = false;
 
     if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS) &&
         status_check_result != VK_SUCCESS) {
@@ -4542,6 +4556,13 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    VkResult result = tu_cmd_buffer_begin(cmd_buffer, pBeginInfo);
    if (result != VK_SUCCESS)
       return result;
+
+   if (cmd_buffer->device->vk.enabled_features.fragmentDensityMapDeferred) {
+      cmd_buffer->deferred_recording =
+         cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+      if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+         return VK_SUCCESS;
+   }
 
    /* setup initial configuration into command buffer */
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
@@ -5465,6 +5486,15 @@ VKAPI_ATTR VkResult VKAPI_CALL
 tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+
+   if (cmd_buffer->deferred_recording) {
+      cmd_buffer->deferred_recording = false;
+      if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+         return vk_command_buffer_end(&cmd_buffer->vk);
+      cmd_buffer->deferred_replaying = true;
+      tu_deferred_execute(cmd_buffer, cmd_buffer);
+      cmd_buffer->deferred_replaying = false;
+   }
 
    /* We currently flush CCU at the end of the command buffer, like
     * what the blob does. There's implicit synchronization around every
@@ -6485,6 +6515,14 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
    VkResult result;
 
    assert(commandBufferCount > 0);
+
+   if (cmd->device->vk.enabled_features.fragmentDensityMapDeferred) {
+      for (uint32_t i = 0; i < commandBufferCount; i++) {
+         VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
+         tu_deferred_execute(cmd, secondary);
+      }
+      return;
+   }
 
    /* Emit any pending flushes. */
    if (cmd->state.pass) {

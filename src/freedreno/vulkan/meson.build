@@ -42,6 +42,7 @@ libtu_files = files(
   'tu_cs_breadcrumbs.cc',
   'tu_cs.cc',
   'tu_device.cc',
+  'tu_deferred.cc',
   'tu_descriptor_set.cc',
   'tu_dynamic_rendering.cc',
   'tu_event.cc',
@@ -63,6 +64,18 @@ libtu_files = files(
   'tu_subsampled_image.cc',
   'tu_tile_config.cc',
   'tu_util.cc',
+)
+
+libtu_files += custom_target(
+  'tu_deferred_dispatch',
+  input : ['tu_deferred_dispatch_gen.py', vk_api_xml],
+  output : 'tu_deferred_dispatch.cc',
+  command : [
+    prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--out', '@OUTPUT@',
+    '--import-path', join_paths(dir_source_root, 'src/vulkan/util'),
+    '--beta', with_vulkan_beta.to_string(),
+  ],
+  depend_files : vk_cmd_queue_gen_depend_files + files('../../vulkan/util/vk_cmd_queue_gen.py'),
 )
 
 libtu_files += custom_target(

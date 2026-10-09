@@ -237,6 +237,12 @@ tu6_disable_lrz_via_depth_view(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    tu_emit_event_write<CHIP>(cmd, cs, FD_LRZ_FLUSH);
 }
 
+static bool
+tu_lrz_fast_clear_allowed(const struct tu_device *device)
+{
+   return device->physical_device->info->chip < 8 || TU_DEBUG(LRZFC);
+}
+
 static void
 tu_lrz_init_state(struct tu_cmd_buffer *cmd,
                   const struct tu_render_pass_attachment *att,
@@ -289,7 +295,8 @@ tu_lrz_init_state(struct tu_cmd_buffer *cmd,
     * secondary cmdbufs and when reusing previous LRZ state.
     */
    cmd->state.lrz.fast_clear =
-      view->image->lrz_layout.lrz_fc_size > 0 && !TU_DEBUG(NOLRZFC);
+      view->image->lrz_layout.lrz_fc_size > 0 && !TU_DEBUG(NOLRZFC) &&
+      tu_lrz_fast_clear_allowed(cmd->device);
 
    cmd->state.lrz.gpu_dir_tracking = has_gpu_tracking;
    cmd->state.lrz.reuse_previous_state = !clears_depth;
@@ -350,7 +357,7 @@ tu_lrz_init_secondary(struct tu_cmd_buffer *cmd,
     * the normal case and enable fast clear even if the depth image doesn't
     * support it.
     */
-   cmd->state.lrz.fast_clear = true;
+   cmd->state.lrz.fast_clear = tu_lrz_fast_clear_allowed(cmd->device);
 
    /* These are not used inside secondaries */
    cmd->state.lrz.image_view = NULL;
@@ -1075,7 +1082,8 @@ tu_lrz_clear_depth_image(struct tu_cmd_buffer *cmd,
 
    bool fast_clear = image->lrz_layout.lrz_fc_size &&
                      tu_lrzfc_depth_supported<CHIP>(pDepthStencil->depth) &&
-                     !TU_DEBUG(NOLRZFC);
+                     !TU_DEBUG(NOLRZFC) &&
+                     tu_lrz_fast_clear_allowed(cmd->device);
 
    tu6_emit_lrz_buffer<CHIP>(&cmd->cs, image);
 

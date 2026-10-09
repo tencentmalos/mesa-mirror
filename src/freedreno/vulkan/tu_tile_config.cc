@@ -90,7 +90,7 @@ tu_calc_frag_area(struct tu_cmd_buffer *cmd,
             sample_pos.y = (y1 + MIN2(y2, fb->height)) / 2;
          }
 
-         tu_fragment_density_map_sample(fdm,
+         tu_fragment_density_map_sample(fdm, cmd->fdm_host_snapshot,
                                         sample_pos.x,
                                         sample_pos.y,
                                         fb->width, fb->height, i,
