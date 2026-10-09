@@ -349,6 +349,9 @@ tu_cs_reset(struct tu_cs *cs);
 VkResult
 tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);
 
+VkResult
+tu_cs_replay_entries(struct tu_cs *cs, uint32_t first, uint32_t count);
+
 /**
  * Get the size of the command packets emitted since the last call to
  * tu_cs_add_entry.

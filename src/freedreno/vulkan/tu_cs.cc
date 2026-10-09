@@ -287,6 +287,25 @@ tu_cs_begin(struct tu_cs *cs)
    assert(tu_cs_is_empty(cs) || cs->status != VK_SUCCESS);
 }
 
+VkResult
+tu_cs_replay_entries(struct tu_cs *cs, uint32_t first, uint32_t count)
+{
+   assert(cs->mode == TU_CS_MODE_GROW);
+   assert(!cs->cond_stack_depth);
+   assert(first <= cs->entry_count && count <= cs->entry_count - first);
+   if (cs->status != VK_SUCCESS)
+      return cs->status;
+
+   tu_cs_end(cs);
+   for (uint32_t i = 0; i < count; i++) {
+      VkResult result = tu_cs_reserve_entry(cs);
+      if (result != VK_SUCCESS)
+         return result;
+      cs->entries[cs->entry_count++] = cs->entries[first + i];
+   }
+   return VK_SUCCESS;
+}
+
 /**
  * End command packet emission.  This adds an IB entry when \a cs is in
  * TU_CS_MODE_GROW mode.

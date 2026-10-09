@@ -10662,13 +10662,14 @@ tu_mesh_draw_cost(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
       cost.programs = 1;
    }
    if (draw->indirect) {
-      cost.dwords += setup_words + (draw->count ? 7 : 0);
-      cost.data_dwords += setup_data;
-      cost.programs++;
-      if (cost.dwords + cost.data_dwords > UINT64_MAX / 4 / draw->draw_count)
+      uint64_t entry_words = 4 + DIV_ROUND_UP(sizeof(struct tu_cs_entry), 4);
+      uint64_t per_draw = setup_words + (draw->count ? 7 : 0) +
+         (cost.chunks + cost.programs + 2) * entry_words;
+      if (per_draw + setup_data > UINT64_MAX / 8 / draw->draw_count)
          return { UINT64_MAX / 4, 0, 0, 0 };
-      cost.dwords *= draw->draw_count;
-      cost.data_dwords *= draw->draw_count;
+      cost.dwords += per_draw * draw->draw_count;
+      cost.data_dwords += setup_data * draw->draw_count;
+      cost.programs++;
       cost.programs *= draw->draw_count;
       cost.chunks *= draw->draw_count;
    } else {
@@ -10756,6 +10757,8 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
 
    uint64_t common_bytes = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs) - before;
    before = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs);
+   uint64_t replayed_bytes = 0;
+   uint64_t replay_entry_bytes = 0;
 
    cmd->state.rp.has_mesh = true;
    cmd->state.compute_program_stale = true;
@@ -10793,6 +10796,8 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
                                               ts->mesh.chunk_workgroups) : 0;
       assert(mesh_chunks <= TU_MESH_MAX_CHUNKS);
       assert(task_chunks <= TU_MESH_MAX_CHUNKS);
+      uint32_t body_first = 0, body_entries = 0;
+      uint64_t body_bytes = 0;
       for (uint32_t first = 0; first < draw->draw_count;
            first += table_entries) {
          struct tu_mesh_setup setup = {
@@ -10813,25 +10818,45 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
          };
          tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
 
-         if (!ts) {
-            tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, mesh_chunks);
+         if (body_entries) {
+            VkResult result = tu_cs_replay_entries(cs, body_first, body_entries);
+            if (result != VK_SUCCESS) {
+               vk_command_buffer_set_error(&cmd->vk, result);
+               return;
+            }
+            replayed_bytes += body_bytes;
+            replay_entry_bytes += body_entries *
+               (sizeof(struct tu_cs_entry) + 4 * sizeof(uint32_t));
             continue;
          }
 
-         for (uint32_t i = 0; i < task_chunks; i++) {
-            uint64_t args = tu_mesh_chunk_args(cmd, TU_MESH_TS_TABLE_OFFSET, i);
-            tu_mesh_begin_chunk_cond<CHIP>(cs, args, TU_PREDICATE_MESH_TASK);
-            tu_mesh_emit_task_chunk<CHIP>(cmd, cs,
-                                          i * ts->mesh.chunk_workgroups, 0,
-                                          args);
-            tu_cond_exec_end(cs);
+         tu_cs_end(cs);
+         body_first = cs->entry_count;
+         if (!ts) {
+            tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, mesh_chunks);
+         } else {
+            for (uint32_t i = 0; i < task_chunks; i++) {
+               uint64_t args = tu_mesh_chunk_args(cmd, TU_MESH_TS_TABLE_OFFSET, i);
+               tu_mesh_begin_chunk_cond<CHIP>(cs, args, TU_PREDICATE_MESH_TASK);
+               tu_mesh_emit_task_chunk<CHIP>(cmd, cs,
+                                             i * ts->mesh.chunk_workgroups, 0,
+                                             args);
+               tu_cond_exec_end(cs);
+            }
          }
+         tu_cs_end(cs);
+         body_entries = cs->entry_count - body_first;
+         for (uint32_t i = 0; i < body_entries; i++)
+            body_bytes += cs->entries[body_first + i].size;
       }
    }
 
    if (tu_cs_get_status(cs) != VK_SUCCESS || tu_cs_get_status(&cmd->sub_cs) != VK_SUCCESS)
       return;
-   uint64_t actual = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs) - before;
+   uint64_t actual = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs) - before -
+      replayed_bytes + replay_entry_bytes;
+   if (!tu_mesh_check_budget(cmd, actual + common_bytes))
+      return;
    cmd->mesh_stats.draws++;
    cmd->mesh_stats.chunks += cost.chunks;
    cmd->mesh_stats.programs += cost.programs;
