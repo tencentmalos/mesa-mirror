@@ -10497,6 +10497,25 @@ tu_mesh_emit_ms_chunks(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 }
 
+static uint32_t
+tu_mesh_task_launch_bound(const struct tu_cmd_buffer *cmd,
+                         const struct tu_shader *ts)
+{
+   uint64_t groups = 1;
+   bool has_pc = false;
+   for (unsigned i = 0; i < 3; i++) {
+      uint32_t pc = ts->mesh.task_launch_pc[i];
+      uint32_t dim = ts->mesh.task_launch_dim_bound[i];
+      if (pc != UINT32_MAX) {
+         dim = MIN2(dim, cmd->push_constants[pc]);
+         has_pc = true;
+      }
+      groups = MIN2(groups * dim, TU_MESH_MAX_WORKGROUPS);
+   }
+   return has_pc ? MIN2(groups, ts->mesh.task_launch_bound)
+                 : ts->mesh.task_launch_bound;
+}
+
 /* Runs one chunk of the task table, then the mesh workgroups it launched. */
 template <chip CHIP>
 static void
@@ -10519,7 +10538,11 @@ tu_mesh_emit_task_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       .count_iova = args,
       .chunk = ms->mesh.chunk_workgroups,
       .vertices = (uint32_t) ms->mesh.max_primitives * ms->mesh.verts_per_prim,
-      .chunks = TU_MESH_MAX_CHUNKS,
+      .chunks = (uint32_t) MIN2(
+         DIV_ROUND_UP((uint64_t) (args ? ts->mesh.chunk_workgroups : groups) *
+                         tu_mesh_task_launch_bound(cmd, ts),
+                      ms->mesh.chunk_workgroups),
+         TU_MESH_MAX_CHUNKS),
    };
    tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
    tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, setup.chunks);
@@ -10532,6 +10555,22 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    struct tu_cs *cs = &cmd->draw_cs;
    const struct tu_shader *ts = cmd->state.shaders[MESA_SHADER_TASK];
    const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+
+   if (ts) {
+      uint64_t parents = draw->indirect ? TU_MESH_MAX_WORKGROUPS :
+         (uint64_t) draw->groups[0] * draw->groups[1] * draw->groups[2];
+      uint64_t children = MIN2(parents, ts->mesh.chunk_workgroups) *
+                          tu_mesh_task_launch_bound(cmd, ts);
+      uint64_t chunks = DIV_ROUND_UP(children, ms->mesh.chunk_workgroups);
+      uint64_t commands = DIV_ROUND_UP(parents, ts->mesh.chunk_workgroups) * chunks;
+      if (draw->indirect)
+         commands *= draw->draw_count;
+      if (children > UINT32_MAX || chunks > TU_MESH_MAX_CHUNKS ||
+          commands > (1u << 18)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+   }
 
    if (draw->indirect)
       tu6_emit_empty_vs_params<CHIP>(cmd);
@@ -10560,10 +10599,13 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
          tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, false, count);
       }
    } else {
-      uint32_t table_entries = ts ? TU_MESH_TABLE_MAX_ENTRIES : 1;
+      uint32_t table_entries = 1;
       uint32_t mesh_chunks = DIV_ROUND_UP(TU_MESH_MAX_WORKGROUPS,
                                          ms->mesh.chunk_workgroups);
+      uint32_t task_chunks = ts ? DIV_ROUND_UP(TU_MESH_MAX_WORKGROUPS,
+                                              ts->mesh.chunk_workgroups) : 0;
       assert(mesh_chunks <= TU_MESH_MAX_CHUNKS);
+      assert(task_chunks <= TU_MESH_MAX_CHUNKS);
       for (uint32_t first = 0; first < draw->draw_count;
            first += table_entries) {
          struct tu_mesh_setup setup = {
@@ -10580,7 +10622,7 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
                         : ms->mesh.chunk_workgroups,
             .vertices = ts ? 0 : (uint32_t) ms->mesh.max_primitives *
                                  ms->mesh.verts_per_prim,
-            .chunks = ts ? TU_MESH_MAX_TASK_CHUNKS : mesh_chunks,
+            .chunks = ts ? task_chunks : mesh_chunks,
          };
          tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
 
@@ -10589,7 +10631,7 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
             continue;
          }
 
-         for (uint32_t i = 0; i < TU_MESH_MAX_TASK_CHUNKS; i++) {
+         for (uint32_t i = 0; i < task_chunks; i++) {
             uint64_t args = tu_mesh_chunk_args(cmd, TU_MESH_TS_TABLE_OFFSET, i);
             tu_mesh_begin_chunk_cond<CHIP>(cs, args, TU_PREDICATE_MESH_TASK);
             tu_mesh_emit_task_chunk<CHIP>(cmd, cs,

@@ -3912,11 +3912,10 @@ tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
 
    unsigned payload_stride = 0;
    if (nir[MESA_SHADER_TASK]) {
-      payload_stride = tu_mesh_lower_ts(nir[MESA_SHADER_TASK]);
-      info[MESA_SHADER_TASK].mesh = (struct tu_mesh_state) {
-         .chunk_workgroups = tu_mesh_task_chunk(payload_stride),
-         .task_payload_stride = payload_stride,
-      };
+      struct tu_mesh_state *state = &info[MESA_SHADER_TASK].mesh;
+      payload_stride = tu_mesh_lower_ts(nir[MESA_SHADER_TASK], state);
+      state->chunk_workgroups = tu_mesh_task_chunk(payload_stride);
+      state->task_payload_stride = payload_stride;
    }
 
    VkPrimitiveTopology topology =

@@ -45,7 +45,6 @@ enum tu_mesh_source {
 #define TU_MESH_PARAMS_OFFSET 0
 #define TU_MESH_MAX_CHUNKS 32768
 #define TU_MESH_MAX_WORKGROUPS (1u << 22)
-#define TU_MESH_MAX_TASK_CHUNKS 4
 #define TU_MESH_TABLE_MAX_ENTRIES 16384
 #define TU_MESH_TABLE_ENTRY_SIZE 32
 /* Chunk arguments: dispatch size, enable flag, then a VkDrawIndirectCommand. */
@@ -97,6 +96,9 @@ struct tu_mesh_state {
    uint32_t stride;
    uint32_t chunk_workgroups;
    uint32_t task_payload_stride;
+   uint32_t task_launch_bound;
+   uint32_t task_launch_dim_bound[3];
+   uint32_t task_launch_pc[3];
    uint16_t max_primitives;
    uint8_t verts_per_prim;
    uint8_t topology;
@@ -114,7 +116,7 @@ tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,
                  unsigned task_payload_stride);
 
 unsigned
-tu_mesh_lower_ts(nir_shader *ts);
+tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state);
 
 unsigned
 tu_mesh_task_chunk(unsigned task_payload_stride);

@@ -355,11 +355,13 @@ lower_sysval_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       break;
    }
    case nir_intrinsic_set_vertex_and_primitive_count: {
+      nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
       nir_deref_instr *counts = nir_build_deref_var(b, state->counts);
       nir_store_deref(b, nir_build_deref_array_imm(b, counts, 0),
                       intr->src[0].ssa, 0x1);
       nir_store_deref(b, nir_build_deref_array_imm(b, counts, 1),
                       intr->src[1].ssa, 0x1);
+      nir_pop_if(b, NULL);
       nir_instr_remove(&intr->instr);
       return true;
    }
@@ -727,11 +729,53 @@ tu_mesh_task_chunk(unsigned task_payload_stride)
 }
 
 unsigned
-tu_mesh_lower_ts(nir_shader *ts)
+tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state)
 {
    lower_task_payload_vars(ts);
    nir_lower_task_shader_options options = {};
    NIR_PASS(_, ts, nir_lower_task_shader, options);
+   NIR_PASS(_, ts, nir_lower_explicit_io, nir_var_mem_push_const,
+            nir_address_format_32bit_offset);
+   NIR_PASS(_, ts, nir_opt_constant_folding);
+
+   unsigned launches = 0;
+   state->task_launch_bound = 0;
+   for (unsigned i = 0; i < 3; i++)
+      state->task_launch_pc[i] = UINT32_MAX;
+   struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
+   nir_foreach_block (block, nir_shader_get_entrypoint(ts)) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_launch_mesh_workgroups)
+            continue;
+         launches++;
+         uint64_t groups = 1;
+         for (unsigned i = 0; i < 3; i++) {
+            nir_scalar dim = nir_scalar_resolved(intr->src[0].ssa, i);
+            uint32_t bound = nir_unsigned_upper_bound(ts, ranges, dim);
+            groups = MIN2(groups * bound, TU_MESH_MAX_WORKGROUPS);
+            state->task_launch_dim_bound[i] = bound;
+            if (launches == 1 && nir_scalar_is_intrinsic(dim) &&
+                nir_scalar_intrinsic_op(dim) == nir_intrinsic_load_push_constant) {
+               nir_intrinsic_instr *load = nir_scalar_as_intrinsic(dim);
+               if (nir_src_is_const(load->src[0])) {
+                  uint64_t offset = (uint64_t) nir_intrinsic_base(load) +
+                                    nir_src_as_uint(load->src[0]) + dim.comp * 4;
+                  if (!(offset & 3) && offset < MAX_PUSH_CONSTANTS_SIZE)
+                     state->task_launch_pc[i] = offset / 4;
+               }
+            }
+         }
+         state->task_launch_bound = MAX2(state->task_launch_bound, groups);
+      }
+   }
+   if (launches != 1) {
+      for (unsigned i = 0; i < 3; i++)
+         state->task_launch_pc[i] = UINT32_MAX;
+   }
+   _mesa_hash_table_destroy(ranges, NULL);
 
    unsigned stride =
       align(TU_MESH_TASK_HEADER_SIZE + ts->info.task_payload_size, 16);

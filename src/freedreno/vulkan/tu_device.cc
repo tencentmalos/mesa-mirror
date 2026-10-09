@@ -841,7 +841,8 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->memoryUnmapReserve = true;
 
    /* VK_EXT_mesh_shader */
-   features->taskShader = false;
+   features->taskShader = tu_has_mesh_shader(pdevice) &&
+                          debug_get_bool_option("TU_EXPERIMENTAL_TASK", false);
    features->meshShader = tu_has_mesh_shader(pdevice);
    features->multiviewMeshShader = false;
    features->primitiveFragmentShadingRateMeshShader = false;
