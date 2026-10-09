@@ -37,6 +37,7 @@ test_lowering(const nir_shader_compiler_options *options, bool task,
    }
    nir_validate_shader(b.shader, "mesh invocation queries");
    unsigned atomics = 0;
+   unsigned primitive_atomics = 0;
    nir_foreach_block (block, nir_shader_get_entrypoint(b.shader)) {
       nir_foreach_instr (instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
@@ -46,6 +47,16 @@ test_lowering(const nir_shader_compiler_options *options, bool task,
             continue;
          check(nir_intrinsic_atomic_op(intr) == nir_atomic_op_iadd);
          check(intr->def.bit_size == 64);
+         nir_def *address = intr->src[0].ssa;
+         if (nir_def_instr(address)->type == nir_instr_type_alu) {
+            nir_alu_instr *add = nir_instr_as_alu(nir_def_instr(address));
+            if (add->op == nir_op_iadd && nir_src_is_const(add->src[1].src) &&
+                nir_src_as_uint(add->src[1].src) == TU_MESH_QUERY_PRIMITIVES * 8) {
+               check(!task);
+               primitive_atomics++;
+               continue;
+            }
+         }
          check(nir_src_as_uint(intr->src[1]) == x * y * z);
          check(nir_cf_node_is_last(&block->cf_node));
          nir_if *condition = nir_cf_node_as_if(block->cf_node.parent);
@@ -58,7 +69,6 @@ test_lowering(const nir_shader_compiler_options *options, bool task,
             check(invocation->intrinsic == nir_intrinsic_load_local_invocation_index);
             check(nir_src_as_uint(compare->src[1].src) == 0);
          }
-         nir_def *address = intr->src[0].ssa;
          if (!task) {
             nir_alu_instr *add = nir_instr_as_alu(nir_def_instr(address));
             check(add->op == nir_op_iadd);
@@ -70,6 +80,7 @@ test_lowering(const nir_shader_compiler_options *options, bool task,
       }
    }
    check(atomics == unsigned(queries));
+   check(primitive_atomics == unsigned(queries && !task));
    ralloc_free(b.shader);
 }
 

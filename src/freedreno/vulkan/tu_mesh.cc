@@ -560,6 +560,44 @@ task_slot_addr(nir_builder *b, nir_def *ring, nir_def *slot,
                                 TU_MESH_TASK_OFFSET));
 }
 
+static void
+count_primitives(nir_builder *b, nir_def *ring, const struct ms_epilogue *e)
+{
+   nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
+   nir_def *rasterize = nir_load_global(
+      b, 1, 32, addr_add(b, ring, nir_imm_int(b, TU_MESH_QUERY_RASTERIZE_OFFSET)),
+      .align_mul = 4);
+   nir_push_if(b, nir_ine_imm(b, rasterize, 0));
+   nir_def *count = e->prim_count;
+   if (e->has_cull) {
+      nir_variable *index = nir_local_variable_create(b->impl, glsl_uint_type(), "query_index");
+      nir_variable *live = nir_local_variable_create(b->impl, glsl_uint_type(), "query_live");
+      nir_store_var(b, index, nir_imm_int(b, 0), 1);
+      nir_store_var(b, live, nir_imm_int(b, 0), 1);
+      nir_push_loop(b);
+      nir_def *p = nir_load_var(b, index);
+      nir_break_if(b, nir_uge(b, p, e->prim_count));
+      nir_def *cull = nir_load_global(
+         b, 1, 32, addr_add(b, e->rec, nir_iadd_imm(b, nir_imul_imm(b, p, 4),
+                                                  e->io->cull_offset)),
+         .align_mul = 4);
+      nir_store_var(b, live, nir_iadd(b, nir_load_var(b, live),
+                                      nir_b2i32(b, nir_ieq_imm(b, cull, 0))), 1);
+      nir_store_var(b, index, nir_iadd_imm(b, p, 1), 1);
+      nir_pop_loop(b, NULL);
+      count = nir_load_var(b, live);
+   }
+   nir_push_if(b, nir_ine_imm(b, count, 0));
+   nir_def *address = nir_load_global(
+      b, 1, 64, addr_add(b, ring, nir_imm_int(b, TU_MESH_QUERY_ADDRESS_OFFSET)),
+      .align_mul = 8);
+   nir_global_atomic(b, 64, nir_iadd_imm(b, address, TU_MESH_QUERY_PRIMITIVES * 8),
+                     nir_u2u64(b, count), .atomic_op = nir_atomic_op_iadd);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+}
+
 static nir_def *
 task_payload_addr(nir_builder *b, nir_def *ring, nir_def *slot,
                   unsigned payload_stride)
@@ -724,6 +762,8 @@ tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,
    epilogue.prim_count =
       nir_umin(b, nir_load_array_var_imm(b, sysvals.counts, 1),
                nir_imm_int(b, io->max_primitives));
+   if (queries)
+      count_primitives(b, ring, &epilogue);
    emit_workgroup_loop(b, io->max_primitives, wg_size, write_indices, &epilogue);
 
    lower_task_payload_vars(ms);

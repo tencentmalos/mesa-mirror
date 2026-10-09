@@ -41,7 +41,7 @@
  * to shift to reading them individually, like gallium does.
  */
 #define STAT_COUNT ((__COUNTER_REG(A6XX, CSINVOCATIONS).reg - __COUNTER_REG(A6XX, IAVERTICES).reg) / 2 + 1)
-#define TOTAL_STAT_COUNT (STAT_COUNT + TU_MESH_QUERY_COUNT)
+#define TOTAL_STAT_COUNT (STAT_COUNT + TU_MESH_QUERY_INVOCATION_COUNT)
 static_assert(sizeof_field(struct tu6_global, mesh_invocations) ==
               TU_MESH_QUERY_COUNT * sizeof(uint64_t));
 
@@ -343,6 +343,7 @@ tu_CreateQueryPool(VkDevice _device,
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
       slot_size = sizeof(struct primitive_query_slot);
       break;
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
       slot_size = sizeof(struct primitives_generated_query_slot);
       break;
@@ -517,6 +518,7 @@ get_result_count(struct tu_query_pool *pool)
    /* Occulusion and timestamp queries write one integer value */
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
@@ -818,6 +820,7 @@ tu_GetQueryPoolResults(VkDevice _device,
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
    case VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR:
@@ -976,6 +979,7 @@ tu_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
@@ -1063,6 +1067,7 @@ tu_CmdResetQueryPool(VkCommandBuffer commandBuffer,
    case VK_QUERY_TYPE_TIMESTAMP:
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
    case VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR:
@@ -1186,6 +1191,41 @@ emit_mesh_stat_snapshot(struct tu_cmd_buffer *cmdbuf, struct tu_cs *cs,
       tu_cs_emit_qw(cs, global_iova_arr(cmdbuf, mesh_invocations,
                                       index - STAT_COUNT));
    }
+}
+
+template <chip CHIP>
+static void
+emit_mesh_primitive_query(struct tu_cmd_buffer *cmdbuf,
+                          struct tu_query_pool *pool, uint32_t query, bool end)
+{
+   struct tu_cs *cs = cmdbuf->state.pass ? &cmdbuf->draw_cs : &cmdbuf->cs;
+   uint64_t snapshot = end ? primitives_generated_query_iova(pool, query, end) :
+                             primitives_generated_query_iova(pool, query, begin);
+   tu_cs_emit_wfi(cs);
+   tu_emit_event_write<CHIP>(cmdbuf, cs, FD_CACHE_CLEAN);
+   emit_counter_barrier<CHIP>(cs);
+   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+   tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+   tu_cs_emit(cs, CP_MEM_TO_MEM_0_DOUBLE | CP_MEM_TO_MEM_0_WAIT_FOR_MEM_WRITES);
+   tu_cs_emit_qw(cs, snapshot);
+   tu_cs_emit_qw(cs, global_iova_arr(cmdbuf, mesh_invocations, TU_MESH_QUERY_PRIMITIVES));
+   if (!end)
+      return;
+
+   uint64_t result = primitives_generated_query_iova(pool, query, result);
+   tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 9);
+   tu_cs_emit(cs, CP_MEM_TO_MEM_0_DOUBLE | CP_MEM_TO_MEM_0_NEG_C |
+                  CP_MEM_TO_MEM_0_WAIT_FOR_MEM_WRITES);
+   tu_cs_emit_qw(cs, result);
+   tu_cs_emit_qw(cs, result);
+   tu_cs_emit_qw(cs, snapshot);
+   tu_cs_emit_qw(cs, primitives_generated_query_iova(pool, query, begin));
+   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   if (cmdbuf->state.pass)
+      cs = &cmdbuf->draw_epilogue_cs;
+   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
+   tu_cs_emit_qw(cs, query_available_iova(pool, query));
+   tu_cs_emit_qw(cs, 1);
 }
 
 template <chip CHIP>
@@ -1500,6 +1540,9 @@ tu_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer,
       break;
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
       emit_begin_xfb_query<CHIP>(cmdbuf, pool, query, index);
+      break;
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      emit_mesh_primitive_query<CHIP>(cmdbuf, pool, query, false);
       break;
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
       emit_begin_prim_generated_query<CHIP>(cmdbuf, pool, query);
@@ -2110,6 +2153,9 @@ tu_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer,
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
       assert(index <= 4);
       emit_end_xfb_query<CHIP>(cmdbuf, pool, query, index);
+      break;
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      emit_mesh_primitive_query<CHIP>(cmdbuf, pool, query, true);
       break;
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
       emit_end_prim_generated_query<CHIP>(cmdbuf, pool, query);

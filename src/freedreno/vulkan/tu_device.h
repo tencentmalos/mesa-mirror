@@ -292,7 +292,7 @@ struct tu6_global
    uint64_t preemption_latency_cmp_scratch;
    uint64_t zero_64b;
 
-   alignas(64) uint64_t mesh_invocations[2];
+   alignas(64) uint64_t mesh_invocations[3];
 
    struct bcolor_entry bcolor_builtin[TU_BORDER_COLOR_BUILTIN];
    struct bcolor_entry bcolor[];

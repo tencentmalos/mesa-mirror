@@ -10674,6 +10674,8 @@ tu_mesh_draw_cost(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    } else {
       cost.dwords += 4 + 3 + TU_MESH_TABLE_ENTRY_SIZE / 4 + cp_barrier;
    }
+   if (cmd->device->vk.enabled_features.meshShaderQueries)
+      cost.dwords += 7;
    return cost;
 }
 
@@ -10758,6 +10760,15 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    cmd->state.rp.has_mesh = true;
    cmd->state.compute_program_stale = true;
    cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   if (cmd->device->vk.enabled_features.meshShaderQueries) {
+      tu_cs_emit_wfi(cs);
+      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
+      tu_cs_emit_qw(cs, tu_mesh_ring(cmd, TU_MESH_QUERY_RASTERIZE_OFFSET));
+      tu_cs_emit(cs, !cmd->vk.dynamic_graphics_state.rs.rasterizer_discard_enable);
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+   }
 
    if (!draw->indirect) {
       uint32_t count = draw->groups[0] * draw->groups[1] * draw->groups[2];

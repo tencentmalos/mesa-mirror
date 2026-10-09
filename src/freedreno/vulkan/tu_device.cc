@@ -846,7 +846,8 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->meshShader = tu_has_mesh_shader(pdevice);
    features->multiviewMeshShader = false;
    features->primitiveFragmentShadingRateMeshShader = false;
-   features->meshShaderQueries = false;
+   features->meshShaderQueries = tu_has_mesh_shader(pdevice) &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH_QUERIES", false);
 
    /* VK_EXT_multi_draw */
    features->multiDraw = true;
