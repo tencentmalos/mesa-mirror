@@ -206,6 +206,7 @@ tu_lrz_emit_force_disable_for_rp(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    if (CHIP >= A7XX) {
       const struct tu_reg_value reg = GRAS_SC_BIN_CNTL(CHIP, .force_lrz_dis = true);
 
+      cmd->state.rp.lrz_rmw_emitted = true;
       cs->rmw(reg, { .src0 = ~0u, .src1 = reg.value });
    } else {
       /* A6XX does not support GRAS_SC_BIN_CNTL.FORCE_LRZ_DIS */
@@ -1145,6 +1146,7 @@ tu_lrz_merge_stencil_tag_state_at_rp_boundary(struct tu_cmd_buffer *cmd,
 
    if (!cmd->state.rp.lrz_write_disabled && dst.has_depth_dependent_stencil_write && dst.incompatible) {
       tu_lrz_disable_write_for_rp(cmd, "incompatible stencil writes based on depth test in s/r chain or secondary");
+      cmd->state.rp.lrz_rmw_emitted = true;
       TU_CALLX(cmd->device, tu_lrz_emit_disable_write_for_rp)(cs);
    }
 }
@@ -1173,6 +1175,7 @@ tu_lrz_flush_valid_at_secondary_rp_boundary(
          tu_lrz_disable_write_for_rp(cmd, reason);
       }
 
+      cmd->state.rp.lrz_rmw_emitted = true;
       tu_lrz_emit_disable_write_for_rp<CHIP>(cs);
       return;
    }
@@ -1190,6 +1193,7 @@ tu_lrz_flush_valid_at_suspending_rp_boundary(struct tu_cmd_buffer *cmd,
       return;
 
    if (cmd->state.lrz.valid) {
+      cmd->state.rp.lrz_rmw_emitted = true;
       tu_lrz_emit_disable_write_for_rp<CHIP>(cs);
       return;
    }

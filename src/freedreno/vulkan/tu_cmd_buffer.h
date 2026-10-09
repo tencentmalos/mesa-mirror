@@ -336,6 +336,7 @@ struct tu_render_pass_state
       bool has_depth_dependent_stencil_write;
       bool incompatible;
    } lrz_stencil_tag;
+   bool lrz_rmw_emitted;
 
    /* This is set if, at any point in the render pass, we were not able to
     * duplicate the viewport per-view due to the user using multiple viewports
