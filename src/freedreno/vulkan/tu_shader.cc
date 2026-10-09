@@ -3900,14 +3900,15 @@ tu6_get_tessmode(const struct nir_shader *shader)
  */
 static void
 tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
-                       struct tu_shader_info *info, void *mem_ctx, bool queries)
+                       struct tu_shader_info *info, void *mem_ctx, bool queries,
+                       bool multiview)
 {
    nir_shader *ms = nir[MESA_SHADER_MESH];
    struct tu_mesh_io io;
    tu_mesh_gather_io(ms, &io);
 
    nir[MESA_SHADER_VERTEX] =
-      tu_mesh_build_vs(ms, &io, ir3_get_compiler_options(dev->compiler));
+      tu_mesh_build_vs(ms, &io, ir3_get_compiler_options(dev->compiler), multiview);
    ralloc_steal(mem_ctx, nir[MESA_SHADER_VERTEX]);
 
    unsigned payload_stride = 0;
@@ -4017,7 +4018,8 @@ tu_compile_shaders(struct tu_device *device,
             mesh_nir[1] = nir_shader_clone(NULL, nir[MESA_SHADER_TASK]);
       }
       tu_lower_mesh_pipeline(device, nir, info, mem_ctx,
-                             keys[MESA_SHADER_MESH].mesh_queries);
+                             keys[MESA_SHADER_MESH].mesh_queries,
+                             keys[MESA_SHADER_MESH].multiview_mask != 0);
    } else if (nir[MESA_SHADER_FRAGMENT]) {
       tu_mesh_lower_fs_inputs(nir[MESA_SHADER_FRAGMENT], false);
    }

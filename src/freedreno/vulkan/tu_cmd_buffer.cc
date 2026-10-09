@@ -10677,6 +10677,7 @@ tu_mesh_draw_cost(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    }
    if (cmd->device->vk.enabled_features.meshShaderQueries)
       cost.dwords += 7;
+   cost.dwords += 5 + cp_barrier;
    return cost;
 }
 
@@ -10732,7 +10733,8 @@ tu_mesh_emit_task_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
 template <chip CHIP>
 static void
-tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
+tu_mesh_draw_view(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw,
+                  uint32_t view)
 {
    struct tu_cs *cs = &cmd->draw_cs;
    const struct tu_shader *ts = cmd->state.shaders[MESA_SHADER_TASK];
@@ -10763,6 +10765,12 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    cmd->state.rp.has_mesh = true;
    cmd->state.compute_program_stale = true;
    cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   tu_cs_emit_wfi(cs);
+   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
+   tu_cs_emit_qw(cs, tu_mesh_ring(cmd, TU_MESH_VIEW_INDEX_OFFSET));
+   tu_cs_emit(cs, view);
+   tu_mesh_emit_cp_barrier<CHIP>(cmd, cs);
 
    if (cmd->device->vk.enabled_features.meshShaderQueries) {
       tu_cs_emit_wfi(cs);
@@ -10871,6 +10879,34 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
       assert(actual <= estimated + 4096);
 
    trace_end_draw(&cmd->rp_trace, cs);
+}
+
+template <chip CHIP>
+static void
+tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
+{
+   if (cmd->vk.record_result != VK_SUCCESS)
+      return;
+
+   uint32_t view_mask = cmd->state.vk_mv.view_mask;
+   if (!view_mask) {
+      tu_mesh_draw_view<CHIP>(cmd, draw, 0);
+      return;
+   }
+
+   struct tu_mesh_cmd_cost cost = tu_mesh_draw_cost<CHIP>(cmd, draw);
+   uint64_t bytes = (cost.dwords + cost.data_dwords) * 4;
+   unsigned views = util_bitcount(view_mask);
+   uint64_t estimated = bytes > UINT64_MAX / views - 65536 ?
+                           UINT64_MAX : (bytes + 65536) * views;
+   if (!tu_mesh_check_budget(cmd, estimated))
+      return;
+
+   u_foreach_bit(view, view_mask) {
+      tu_mesh_draw_view<CHIP>(cmd, draw, view);
+      if (cmd->vk.record_result != VK_SUCCESS)
+         break;
+   }
 }
 
 template <chip CHIP>

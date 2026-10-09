@@ -21,6 +21,9 @@ test_lowering(const nir_shader_compiler_options *options, bool task,
    b.shader->info.workgroup_size[0] = x;
    b.shader->info.workgroup_size[1] = y;
    b.shader->info.workgroup_size[2] = z;
+   if (!task)
+      nir_store_global(&b, nir_load_view_index(&b), nir_imm_int64(&b, 0x100000100),
+                       .align_mul = 4);
    if (task) {
       nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 0, 0, 0));
       tu_mesh_state state = {};
@@ -43,6 +46,7 @@ test_lowering(const nir_shader_compiler_options *options, bool task,
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         check(intr->intrinsic != nir_intrinsic_load_view_index);
          if (intr->intrinsic != nir_intrinsic_global_atomic)
             continue;
          check(nir_intrinsic_atomic_op(intr) == nir_atomic_op_iadd);

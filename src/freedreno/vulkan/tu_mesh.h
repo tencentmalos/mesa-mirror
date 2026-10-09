@@ -45,6 +45,7 @@ enum tu_mesh_source {
 #define TU_MESH_PARAMS_OFFSET 0
 #define TU_MESH_QUERY_ADDRESS_OFFSET 48
 #define TU_MESH_QUERY_RASTERIZE_OFFSET 56
+#define TU_MESH_VIEW_INDEX_OFFSET 60
 #define TU_MESH_QUERY_TASK_INVOCATIONS 0
 #define TU_MESH_QUERY_MESH_INVOCATIONS 1
 #define TU_MESH_QUERY_PRIMITIVES 2
@@ -68,6 +69,8 @@ static_assert(TU_MESH_PARAM_NUM * sizeof(uint32_t) <= TU_MESH_QUERY_ADDRESS_OFFS
 static_assert(TU_MESH_QUERY_ADDRESS_OFFSET + sizeof(uint64_t) <= TU_MESH_MS_TABLE_OFFSET);
 static_assert(TU_MESH_QUERY_ADDRESS_OFFSET + sizeof(uint64_t) <= TU_MESH_QUERY_RASTERIZE_OFFSET);
 static_assert(TU_MESH_QUERY_RASTERIZE_OFFSET + sizeof(uint32_t) <= TU_MESH_MS_TABLE_OFFSET);
+static_assert(TU_MESH_QUERY_RASTERIZE_OFFSET + sizeof(uint32_t) <= TU_MESH_VIEW_INDEX_OFFSET);
+static_assert(TU_MESH_VIEW_INDEX_OFFSET + sizeof(uint32_t) <= TU_MESH_MS_TABLE_OFFSET);
 #define TU_MESH_TS_TABLE_OFFSET (TU_MESH_MS_TABLE_OFFSET + TU_MESH_TABLE_SIZE)
 #define TU_MESH_TASK_OFFSET (TU_MESH_TS_TABLE_OFFSET + TU_MESH_TABLE_SIZE)
 #define TU_MESH_TASK_HEADER_SIZE 16
@@ -120,7 +123,7 @@ tu_mesh_gather_io(const nir_shader *ms, struct tu_mesh_io *io);
 
 nir_shader *
 tu_mesh_build_vs(const nir_shader *ms, const struct tu_mesh_io *io,
-                 const nir_shader_compiler_options *options);
+                 const nir_shader_compiler_options *options, bool multiview);
 
 void
 tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,

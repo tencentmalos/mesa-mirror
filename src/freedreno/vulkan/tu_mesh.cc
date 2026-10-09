@@ -240,7 +240,7 @@ copy_output(nir_builder *b, nir_deref_instr *dst, nir_deref_instr *src)
 
 nir_shader *
 tu_mesh_build_vs(const nir_shader *ms, const struct tu_mesh_io *io,
-                 const nir_shader_compiler_options *options)
+                 const nir_shader_compiler_options *options, bool multiview)
 {
    nir_builder _b =
       nir_builder_init_simple_shader(MESA_SHADER_VERTEX, options, "tu_mesh_vs");
@@ -270,6 +270,12 @@ tu_mesh_build_vs(const nir_shader *ms, const struct tu_mesh_io *io,
                                     .align_mul = 4);
    nir_def *dead = nir_ieq_imm(b, index, TU_MESH_DEAD_INDEX);
    index = nir_bcsel(b, dead, nir_imm_int(b, 0), index);
+   if (multiview) {
+      nir_def *view = nir_load_global(
+         b, 1, 32, addr_add(b, load_ring(b), nir_imm_int(b, TU_MESH_VIEW_INDEX_OFFSET)),
+         .align_mul = 4);
+      dead = nir_ior(b, dead, nir_ine(b, view, nir_load_view_index(b)));
+   }
 
    nir_def *vertex_rec =
       addr_add(b, rec, nir_imul_imm(b, index, io->vertex_slots * 16));
@@ -350,6 +356,11 @@ lower_sysval_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    b->cursor = nir_before_instr(&intr->instr);
 
    switch (intr->intrinsic) {
+   case nir_intrinsic_load_view_index:
+      value = nir_load_global(
+         b, 1, 32, addr_add(b, load_ring(b), nir_imm_int(b, TU_MESH_VIEW_INDEX_OFFSET)),
+         .align_mul = 4);
+      break;
    case nir_intrinsic_load_workgroup_id:
       value = s->workgroup_id;
       break;

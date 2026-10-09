@@ -844,7 +844,8 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->taskShader = tu_has_mesh_shader(pdevice) &&
                           debug_get_bool_option("TU_EXPERIMENTAL_TASK", false);
    features->meshShader = tu_has_mesh_shader(pdevice);
-   features->multiviewMeshShader = false;
+   features->multiviewMeshShader = tu_has_mesh_shader(pdevice) &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH_MULTIVIEW", false);
    features->primitiveFragmentShadingRateMeshShader = false;
    features->meshShaderQueries = tu_has_mesh_shader(pdevice) &&
       debug_get_bool_option("TU_EXPERIMENTAL_MESH_QUERIES", false);
@@ -1509,7 +1510,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxMeshOutputVertices = 256;
    props->maxMeshOutputPrimitives = 256;
    props->maxMeshOutputLayers = 8;
-   props->maxMeshMultiviewViewCount = 1;
+   props->maxMeshMultiviewViewCount = MAX_VIEWS;
    props->meshOutputPerVertexGranularity = 1;
    props->meshOutputPerPrimitiveGranularity = 1;
    props->maxPreferredTaskWorkGroupInvocations = 64;

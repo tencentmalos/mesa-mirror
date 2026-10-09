@@ -1914,6 +1914,15 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
          }
       }
 
+      if (nir[MESA_SHADER_MESH] || stage_infos[MESA_SHADER_MESH]) {
+         keys[MESA_SHADER_VERTEX].multiview_mask =
+            builder->graphics_state.mv->view_mask;
+         keys[MESA_SHADER_MESH].multiview_mask =
+            builder->graphics_state.mv->view_mask;
+         keys[MESA_SHADER_TASK].multiview_mask =
+            builder->graphics_state.mv->view_mask;
+      }
+
       mesa_shader_stage last_pre_rast_stage = MESA_SHADER_VERTEX;
       for (int i = MESA_SHADER_GEOMETRY; i >= MESA_SHADER_VERTEX; i--) {
          if (nir[i]) {
