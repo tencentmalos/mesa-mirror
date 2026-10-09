@@ -3217,6 +3217,7 @@ tu7_emit_concurrent_binning_start(struct tu_cmd_buffer *cmd,
           cmd->state.lrz.image_view &&
           !fdl6_lrz_fc_fully_covered(&cmd->state.lrz.image_view->image->lrz_layout),
           cmd, "partial LRZ fast clear") ||
+       tu7_cb_disable_reason(cmd->state.rp.lrz_rmw_emitted, cmd, "LRZ RMW in render pass") ||
        tu7_cb_disable_reason(!cmd->device->instance->drirc.perf.allow_concurrent_binning, cmd,
                              "globally disabled")) {
      tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
@@ -6371,6 +6372,7 @@ tu_render_pass_state_merge(struct tu_render_pass_state *dst,
    dst->disable_gmem |= src->disable_gmem;
    dst->sysmem_single_prim_mode |= src->sysmem_single_prim_mode;
    dst->lrz_disable_for_next_rp |= src->lrz_disable_for_next_rp;
+   dst->lrz_rmw_emitted |= src->lrz_rmw_emitted;
    dst->draw_cs_writes_to_cond_pred |= src->draw_cs_writes_to_cond_pred;
    dst->shared_viewport |= src->shared_viewport;
    dst->read_only_input_attachments |= src->read_only_input_attachments;

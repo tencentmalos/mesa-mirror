@@ -206,6 +206,7 @@ tu_lrz_emit_force_disable_for_rp(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    if (CHIP >= A7XX) {
       const struct tu_reg_value reg = GRAS_SC_BIN_CNTL(CHIP, .force_lrz_dis = true);
 
+      cmd->state.rp.lrz_rmw_emitted = true;
       cs->rmw(reg, { .src0 = ~0u, .src1 = reg.value });
    } else {
       /* A6XX does not support GRAS_SC_BIN_CNTL.FORCE_LRZ_DIS */
@@ -1146,6 +1147,7 @@ tu_lrz_flush_valid_at_secondary_rp_boundary(
          tu_lrz_disable_write_for_rp(cmd, reason);
       }
 
+      cmd->state.rp.lrz_rmw_emitted = true;
       tu_lrz_emit_disable_write_for_rp<CHIP>(cs);
       return;
    }
@@ -1163,6 +1165,7 @@ tu_lrz_flush_valid_at_suspending_rp_boundary(struct tu_cmd_buffer *cmd,
       return;
 
    if (cmd->state.lrz.valid) {
+      cmd->state.rp.lrz_rmw_emitted = true;
       tu_lrz_emit_disable_write_for_rp<CHIP>(cs);
       return;
    }
