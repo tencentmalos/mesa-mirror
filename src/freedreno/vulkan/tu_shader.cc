@@ -1453,6 +1453,7 @@ shader_uses_push_consts(nir_shader *shader)
 static bool
 tu_lower_io(nir_shader *shader, struct tu_device *dev,
             struct tu_shader *tu_shader,
+            mesa_shader_stage api_stage,
             const struct ir3_shader_key *ir3_key,
             const struct tu_pipeline_layout *layout,
             uint32_t read_only_input_attachments,
@@ -1555,7 +1556,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
          if (binding->type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
             continue;
          if (!(binding->shader_stages &
-               mesa_to_vk_shader_stage(shader->info.stage)))
+               mesa_to_vk_shader_stage(api_stage)))
             continue;
 
          /* If we don't know the size at compile time due to a variable
@@ -3665,6 +3666,7 @@ tu_lower_nir(struct tu_device *dev,
 VkResult
 tu_shader_create(struct tu_device *dev,
                  struct tu_shader **shader_out,
+                 mesa_shader_stage api_stage,
                  nir_shader *nir,
                  const struct tu_shader_key *key,
                  const struct tu_shader_info *info,
@@ -3702,7 +3704,7 @@ tu_shader_create(struct tu_device *dev,
    }
 
    struct ir3_const_allocations const_allocs = {};
-   NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
+   NIR_PASS(_, nir, tu_lower_io, dev, shader, api_stage, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
             &const_allocs);
 
@@ -4114,7 +4116,7 @@ tu_compile_shaders(struct tu_device *device,
       shader_blake3[BLAKE3_KEY_LEN] = (unsigned char) stage;
 
       result = tu_shader_create(device,
-                                &shaders[stage], nir[stage], &keys[stage],
+                                &shaders[stage], stage, nir[stage], &keys[stage],
                                 &info[stage],
                                 &ir3_key, shader_blake3, sizeof(shader_blake3),
                                 layout, !!nir_initial_disasm);
@@ -4326,8 +4328,8 @@ tu_mesh_setup_create(struct tu_device *dev, struct tu_shader **shader)
    struct tu_pipeline_layout layout = {};
 
    tu_lower_nir(dev, nir, &key, &ir3_key, &info);
-   return tu_shader_create(dev, shader, nir, &key, &info, &ir3_key, NULL, 0,
-                           &layout, false);
+   return tu_shader_create(dev, shader, MESA_SHADER_COMPUTE, nir, &key, &info,
+                           &ir3_key, NULL, 0, &layout, false);
 }
 
 VkResult

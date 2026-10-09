@@ -5078,9 +5078,9 @@ tu_compute_pipeline_create(VkDevice device,
 
       struct tu_shader_info info = {};
       tu_lower_nir(dev, nir, &key, &ir3_key, &info);
-      result = tu_shader_create(dev, &shader, nir, &key, &info, &ir3_key,
-                                pipeline_blake3, sizeof(pipeline_blake3), layout,
-                                executable_info);
+      result = tu_shader_create(dev, &shader, MESA_SHADER_COMPUTE, nir, &key,
+                                &info, &ir3_key, pipeline_blake3,
+                                sizeof(pipeline_blake3), layout, executable_info);
       if (!shader) {
          goto fail;
       }

@@ -240,6 +240,7 @@ tu_lower_nir(struct tu_device *dev,
 VkResult
 tu_shader_create(struct tu_device *dev,
                  struct tu_shader **shader_out,
+                 mesa_shader_stage api_stage,
                  nir_shader *nir,
                  const struct tu_shader_key *key,
                  const struct tu_shader_info *shader_info,
