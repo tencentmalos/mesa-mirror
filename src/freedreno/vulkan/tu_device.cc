@@ -3203,6 +3203,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    global->dbg_gmem_taken_stores = 0;
 
    global->zero_64b = 0;
+   memset(global->mesh_invocations, 0, sizeof(global->mesh_invocations));
 
    for (int i = 0; i < TU_BORDER_COLOR_BUILTIN; i++) {
       VkClearColorValue border_color = vk_border_color_value((VkBorderColor) i);

@@ -1796,6 +1796,8 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
         stage < ARRAY_SIZE(keys); stage = (mesa_shader_stage) (stage+1)) {
       keys[stage].version =
          builder->device->instance->drirc.misc.override_graphics_shader_version;
+      keys[stage].mesh_queries =
+         builder->device->vk.enabled_features.meshShaderQueries;
 
       const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroup_info = NULL;
       if (stage_infos[stage])

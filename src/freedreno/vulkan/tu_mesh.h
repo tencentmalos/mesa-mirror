@@ -43,6 +43,10 @@ enum tu_mesh_source {
 };
 
 #define TU_MESH_PARAMS_OFFSET 0
+#define TU_MESH_QUERY_ADDRESS_OFFSET 48
+#define TU_MESH_QUERY_TASK_INVOCATIONS 0
+#define TU_MESH_QUERY_MESH_INVOCATIONS 1
+#define TU_MESH_QUERY_COUNT 2
 #define TU_MESH_MAX_CHUNKS 32768
 #define TU_MESH_MAX_WORKGROUPS (1u << 22)
 #define TU_MESH_TABLE_MAX_ENTRIES 16384
@@ -57,6 +61,8 @@ enum tu_mesh_source {
 #define TU_MESH_TABLE_SIZE                                                   \
    (TU_MESH_TABLE_ENTRIES + TU_MESH_TABLE_MAX_ENTRIES * TU_MESH_TABLE_ENTRY_SIZE)
 #define TU_MESH_MS_TABLE_OFFSET 64
+static_assert(TU_MESH_PARAM_NUM * sizeof(uint32_t) <= TU_MESH_QUERY_ADDRESS_OFFSET);
+static_assert(TU_MESH_QUERY_ADDRESS_OFFSET + sizeof(uint64_t) <= TU_MESH_MS_TABLE_OFFSET);
 #define TU_MESH_TS_TABLE_OFFSET (TU_MESH_MS_TABLE_OFFSET + TU_MESH_TABLE_SIZE)
 #define TU_MESH_TASK_OFFSET (TU_MESH_TS_TABLE_OFFSET + TU_MESH_TABLE_SIZE)
 #define TU_MESH_TASK_HEADER_SIZE 16
@@ -113,10 +119,10 @@ tu_mesh_build_vs(const nir_shader *ms, const struct tu_mesh_io *io,
 
 void
 tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,
-                 unsigned task_payload_stride);
+                 unsigned task_payload_stride, bool queries);
 
 unsigned
-tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state);
+tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state, bool queries);
 
 unsigned
 tu_mesh_task_chunk(unsigned task_payload_stride);

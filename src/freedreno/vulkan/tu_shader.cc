@@ -3900,7 +3900,7 @@ tu6_get_tessmode(const struct nir_shader *shader)
  */
 static void
 tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
-                       struct tu_shader_info *info, void *mem_ctx)
+                       struct tu_shader_info *info, void *mem_ctx, bool queries)
 {
    nir_shader *ms = nir[MESA_SHADER_MESH];
    struct tu_mesh_io io;
@@ -3913,7 +3913,7 @@ tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
    unsigned payload_stride = 0;
    if (nir[MESA_SHADER_TASK]) {
       struct tu_mesh_state *state = &info[MESA_SHADER_TASK].mesh;
-      payload_stride = tu_mesh_lower_ts(nir[MESA_SHADER_TASK], state);
+      payload_stride = tu_mesh_lower_ts(nir[MESA_SHADER_TASK], state, queries);
       state->chunk_workgroups = tu_mesh_task_chunk(payload_stride);
       state->task_payload_stride = payload_stride;
    }
@@ -3923,7 +3923,7 @@ tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
       io.verts_per_prim == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
                                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-   tu_mesh_lower_ms(ms, &io, payload_stride);
+   tu_mesh_lower_ms(ms, &io, payload_stride, queries);
    info[MESA_SHADER_MESH].mesh = (struct tu_mesh_state) {
       .stride = io.stride,
       .chunk_workgroups = io.chunk_workgroups,
@@ -4016,7 +4016,8 @@ tu_compile_shaders(struct tu_device *device,
          if (nir[MESA_SHADER_TASK])
             mesh_nir[1] = nir_shader_clone(NULL, nir[MESA_SHADER_TASK]);
       }
-      tu_lower_mesh_pipeline(device, nir, info, mem_ctx);
+      tu_lower_mesh_pipeline(device, nir, info, mem_ctx,
+                             keys[MESA_SHADER_MESH].mesh_queries);
    } else if (nir[MESA_SHADER_FRAGMENT]) {
       tu_mesh_lower_fs_inputs(nir[MESA_SHADER_FRAGMENT], false);
    }
@@ -4338,6 +4339,17 @@ tu_init_mesh_shading(struct tu_device *dev)
    if (!dev->mesh_ring) {
       result = tu_bo_init_new(dev, NULL, &dev->mesh_ring, TU_MESH_RING_SIZE,
                               TU_BO_ALLOC_INTERNAL_RESOURCE, "mesh ring");
+      if (result == VK_SUCCESS && dev->vk.enabled_features.meshShaderQueries) {
+         result = tu_bo_map(dev, dev->mesh_ring, NULL);
+         if (result == VK_SUCCESS) {
+            uint64_t address = dev->global_bo->iova + gb_offset(mesh_invocations);
+            memcpy((char *) dev->mesh_ring->map + TU_MESH_QUERY_ADDRESS_OFFSET,
+                   &address, sizeof(address));
+         } else {
+            tu_bo_finish(dev, dev->mesh_ring);
+            dev->mesh_ring = NULL;
+         }
+      }
    }
    if (result == VK_SUCCESS && !dev->mesh_setup) {
       struct tu_shader *setup;

@@ -23,6 +23,7 @@
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_device.h"
+#include "tu_mesh.h"
 #include "tu_rmv.h"
 
 #define NSEC_PER_SEC 1000000000ull
@@ -40,6 +41,9 @@
  * to shift to reading them individually, like gallium does.
  */
 #define STAT_COUNT ((__COUNTER_REG(A6XX, CSINVOCATIONS).reg - __COUNTER_REG(A6XX, IAVERTICES).reg) / 2 + 1)
+#define TOTAL_STAT_COUNT (STAT_COUNT + TU_MESH_QUERY_COUNT)
+static_assert(sizeof_field(struct tu6_global, mesh_invocations) ==
+              TU_MESH_QUERY_COUNT * sizeof(uint64_t));
 
 struct alignas(8) query_slot {
    alignas(8) uint64_t available;
@@ -66,10 +70,10 @@ struct alignas(8) primitive_slot_value {
 
 struct alignas(8) pipeline_stat_query_slot {
    struct query_slot common;
-   uint64_t results[STAT_COUNT];
+   uint64_t results[TOTAL_STAT_COUNT];
 
-   uint64_t begin[STAT_COUNT];
-   uint64_t end[STAT_COUNT];
+   uint64_t begin[TOTAL_STAT_COUNT];
+   uint64_t end[TOTAL_STAT_COUNT];
 } PACKED;
 
 struct alignas(8) primitive_query_slot {
@@ -567,6 +571,10 @@ statistics_index(uint32_t *statistics)
       return COUNTER_OFFSET(DSINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT:
       return COUNTER_OFFSET(CSINVOCATIONS);
+   case VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT:
+      return STAT_COUNT + TU_MESH_QUERY_TASK_INVOCATIONS;
+   case VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT:
+      return STAT_COUNT + TU_MESH_QUERY_MESH_INVOCATIONS;
    default:
       return 0;
    }
@@ -1155,6 +1163,33 @@ emit_begin_occlusion_query(struct tu_cmd_buffer *cmdbuf,
 
 template <chip CHIP>
 static void
+emit_mesh_stat_snapshot(struct tu_cmd_buffer *cmdbuf, struct tu_cs *cs,
+                        struct tu_query_pool *pool, uint64_t iova)
+{
+   uint32_t statistics = pool->vk.pipeline_statistics &
+      (VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT |
+       VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT);
+   if (!statistics)
+      return;
+
+   tu_cs_emit_wfi(cs);
+   tu_emit_event_write<CHIP>(cmdbuf, cs, FD_CACHE_CLEAN);
+   emit_counter_barrier<CHIP>(cs);
+   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+
+   while (statistics) {
+      unsigned index = statistics_index<CHIP>(&statistics);
+      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+      tu_cs_emit(cs, CP_MEM_TO_MEM_0_DOUBLE |
+                     CP_MEM_TO_MEM_0_WAIT_FOR_MEM_WRITES);
+      tu_cs_emit_qw(cs, iova + index * sizeof(uint64_t));
+      tu_cs_emit_qw(cs, global_iova_arr(cmdbuf, mesh_invocations,
+                                      index - STAT_COUNT));
+   }
+}
+
+template <chip CHIP>
+static void
 emit_begin_stat_query(struct tu_cmd_buffer *cmdbuf,
                       struct tu_query_pool *pool,
                       uint32_t query)
@@ -1219,6 +1254,7 @@ emit_begin_stat_query(struct tu_cmd_buffer *cmdbuf,
       .cnt = STAT_COUNT * 2,
       .is_64b = true,
    });
+   emit_mesh_stat_snapshot<CHIP>(cmdbuf, cs, pool, begin_iova);
 }
 
 template <chip CHIP>
@@ -1704,8 +1740,11 @@ emit_end_stat_query(struct tu_cmd_buffer *cmdbuf,
       .cnt = STAT_COUNT * 2,
       .is_64b = true,
    });
+   emit_mesh_stat_snapshot<CHIP>(cmdbuf, cs, pool, end_iova);
 
-   for (int i = 0; i < STAT_COUNT; i++) {
+   uint32_t statistics = pool->vk.pipeline_statistics;
+   while (statistics) {
+      unsigned i = statistics_index<CHIP>(&statistics);
       result_iova = query_result_iova(pool, query, uint64_t, i);
       stat_start_iova = pipeline_stat_query_iova(pool, query, begin, i);
       stat_stop_iova = pipeline_stat_query_iova(pool, query, end, i);

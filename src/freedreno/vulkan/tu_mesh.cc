@@ -135,6 +135,21 @@ load_ring(nir_builder *b)
    return nir_pack_64_2x32(b, nir_load_mesh_ring_ir3(b));
 }
 
+static void
+count_invocations(nir_builder *b, nir_def *ring, unsigned counter)
+{
+   unsigned size = b->shader->info.workgroup_size[0] *
+                   b->shader->info.workgroup_size[1] *
+                   b->shader->info.workgroup_size[2];
+   nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
+   nir_def *address = nir_load_global(
+      b, 1, 64, addr_add(b, ring, nir_imm_int(b, TU_MESH_QUERY_ADDRESS_OFFSET)),
+      .align_mul = 8);
+   nir_global_atomic(b, 64, nir_iadd_imm(b, address, counter * sizeof(uint64_t)),
+                     nir_imm_int64(b, size), .atomic_op = nir_atomic_op_iadd);
+   nir_pop_if(b, NULL);
+}
+
 static unsigned
 var_record_offset(const struct tu_mesh_io *io, const nir_variable *var)
 {
@@ -626,7 +641,7 @@ become_compute(nir_shader *nir)
 
 void
 tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,
-                 unsigned task_payload_stride)
+                 unsigned task_payload_stride, bool queries)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(ms);
    nir_builder _b = nir_builder_at(nir_before_impl(impl));
@@ -636,6 +651,9 @@ tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,
                       ms->info.workgroup_size[2];
 
    nir_def *ring = load_ring(b);
+
+   if (queries)
+      count_invocations(b, ring, TU_MESH_QUERY_MESH_INVOCATIONS);
 
    struct lower_sysvals_state sysvals = {
       .counts = nir_variable_create(ms, nir_var_mem_shared,
@@ -729,7 +747,7 @@ tu_mesh_task_chunk(unsigned task_payload_stride)
 }
 
 unsigned
-tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state)
+tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state, bool queries)
 {
    lower_task_payload_vars(ts);
    nir_lower_task_shader_options options = {};
@@ -785,6 +803,9 @@ tu_mesh_lower_ts(nir_shader *ts, struct tu_mesh_state *state)
    nir_builder *b = &_b;
 
    nir_def *ring = load_ring(b);
+
+   if (queries)
+      count_invocations(b, ring, TU_MESH_QUERY_TASK_INVOCATIONS);
 
    struct lower_sysvals_state sysvals = {};
    load_table_sysvals(b, ring, TU_MESH_TS_TABLE_OFFSET, &sysvals.table);

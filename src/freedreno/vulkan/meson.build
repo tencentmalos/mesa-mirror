@@ -295,3 +295,16 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+
+if with_tests
+  test('tu_mesh_query', executable(
+    'tu_mesh_query_test',
+    ['tests/mesh_query_test.cpp', 'tu_mesh.cc', tu_entrypoints[0],
+     freedreno_xml_header_files],
+    include_directories : libtu_includes,
+    link_with : [libfreedreno_ir3],
+    dependencies : [idep_nir, idep_mesautil, idep_vulkan_util,
+                    idep_vulkan_runtime, idep_vulkan_wsi],
+    cpp_args : [tu_cpp_args, tu_flags],
+  ), suite : ['freedreno'])
+endif
