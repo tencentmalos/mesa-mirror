@@ -4410,6 +4410,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    tu_cs_reset(&cmd_buffer->tile_store_cs);
    tu_cs_reset(&cmd_buffer->draw_epilogue_cs);
    tu_cs_reset(&cmd_buffer->sub_cs);
+   cmd_buffer->mesh_stats = {};
    tu_cs_reset(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_epilogue_cs);
 
@@ -5546,6 +5547,14 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
       }
    }
 
+   if (TU_DEBUG(MESH) && (cmd_buffer->mesh_stats.draws || cmd_buffer->mesh_stats.rejected)) {
+      const auto &stats = cmd_buffer->mesh_stats;
+      mesa_logi("mesh draws=%" PRIu64 " chunks=%" PRIu64 " programs=%" PRIu64
+                " bytes=%" PRIu64 " estimated=%" PRIu64 " max_record_bytes=%" PRIu64
+                " rejected=%u", stats.draws, stats.chunks, stats.programs,
+                stats.bytes, stats.estimated_bytes, stats.max_record_bytes, stats.rejected);
+   }
+
    return vk_command_buffer_end(&cmd_buffer->vk);
 }
 TU_GENX(tu_EndCommandBuffer);
@@ -6032,6 +6041,8 @@ vk2tu_access(VkAccessFlags2 flags, VkAccessFlags3KHR flags2,
     VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT | \
     VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT | \
     VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT | \
+    VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | \
+    VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | \
     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | \
     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | \
     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
@@ -10236,10 +10247,12 @@ tu_mesh_chunk_args(const struct tu_cmd_buffer *cmd, uint32_t table,
 /* Makes compute shader writes visible to later shaders and to the CP. */
 template <chip CHIP>
 static void
-tu_mesh_emit_shader_barrier(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+tu_mesh_emit_shader_barrier(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                            bool clean = true)
 {
    tu_cs_emit_wfi(cs);
-   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_CLEAN);
+   if (clean)
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_CLEAN);
    tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
    tu_cs_emit_wfi(cs);
    tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
@@ -10435,6 +10448,8 @@ tu_mesh_emit_setup(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 /* Runs the mesh shader over one chunk of the mesh table and draws its
  * primitives.
  */
+static bool tu_mesh_no_trailing_flush();
+
 template <chip CHIP>
 static void
 tu_mesh_emit_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
@@ -10442,7 +10457,7 @@ tu_mesh_emit_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                    uint32_t groups, uint64_t args)
 {
    tu_mesh_emit_dispatch<CHIP>(cmd, cs, ms, base, groups, args);
-   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs, !tu_mesh_no_trailing_flush());
 
    /* The compute state overwrote part of the fragment shader state. */
    tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3);
@@ -10516,6 +10531,170 @@ tu_mesh_task_launch_bound(const struct tu_cmd_buffer *cmd,
                  : ts->mesh.task_launch_bound;
 }
 
+static bool
+tu_mesh_no_trailing_flush()
+{
+   static const bool enabled =
+      !strcmp(debug_get_option("TU_MESH_DEBUG", ""), "no_trailing_flush");
+   return enabled;
+}
+
+static uint64_t
+tu_mesh_cs_bytes(const struct tu_cs *cs)
+{
+   if (cs->status != VK_SUCCESS)
+      return 0;
+   if (cs->mode == TU_CS_MODE_SUB_STREAM) {
+      uint64_t bytes = 0;
+      for (const struct tu_bo_array *array : { &cs->read_only, &cs->read_write }) {
+         for (unsigned i = 0; i < array->bo_count; i++) {
+            const struct tu_bo *bo = array->bos[i];
+            bool current = i == array->bo_count - 1 &&
+               (cs->writeable ? array == &cs->read_write : array == &cs->read_only);
+            bytes += current ? (char *) cs->cur - (char *) bo->map : bo->size;
+         }
+      }
+      return bytes;
+   }
+   uint64_t bytes = cs->cur ? (cs->cur - cs->start) * 4 : 0;
+   for (unsigned i = 0; i < cs->entry_count; i++)
+      bytes += cs->entries[i].size;
+   return bytes;
+}
+
+template <chip CHIP>
+static uint64_t
+tu_mesh_program_dwords(struct tu_cmd_buffer *cmd, const struct tu_shader *shader)
+{
+   uint32_t data[4096];
+   struct tu_cs cs;
+   tu_cs_init_external(&cs, cmd->device, data, data + ARRAY_SIZE(data), 0, false);
+   tu_cs_reserve_space(&cs, ARRAY_SIZE(data));
+   struct tu_descriptor_state *descriptors =
+      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   tu_emit_cs_consts<CHIP>(cmd, &cs, shader, descriptors);
+   tu6_emit_dynamic_offset(&cs, shader->variant, shader, &cmd->state.program);
+   tu6_emit_bindless_bases<CHIP>(cmd, &cs, descriptors, true);
+   return shader->state.size + tu_cs_get_size(&cs);
+}
+
+template <chip CHIP>
+static uint64_t
+tu_mesh_dispatch_dwords(struct tu_cmd_buffer *cmd, const struct tu_shader *shader,
+                        uint64_t *data_dwords)
+{
+   const struct ir3_shader_variant *v = shader->variant;
+   const struct ir3_const_state *state = v->const_state;
+   const auto &props = cmd->device->physical_device->info->props;
+   uint64_t dwords = 4 + 8 + (CHIP >= A7XX ? 2 : 0) + 5;
+   *data_dwords = 0;
+   if (props.load_shader_consts_via_preamble) {
+      if (state->driver_params_ubo.size) {
+         dwords += 6;
+         *data_dwords = align(state->driver_params_ubo.size, 4);
+      }
+   } else if (ir3_const_can_upload(&state->allocs, IR3_CONST_ALLOC_DRIVER_PARAMS,
+                                  v->constlen)) {
+      unsigned offset = state->allocs.consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4;
+      dwords += 4 + MIN2(state->num_driver_params, (v->constlen - offset) * 4);
+   }
+   if (v->instrlen > props.instr_cache_size)
+      dwords += 2 + 2 * (2 + 3 * fd_gpu_events<CHIP>[FD_LABEL].needs_seqno);
+   if (props.has_rt_workaround && v->info.uses_ray_intersection)
+      dwords += 2;
+   return dwords;
+}
+
+struct tu_mesh_cmd_cost {
+   uint64_t dwords;
+   uint64_t data_dwords;
+   uint64_t chunks;
+   uint64_t programs;
+};
+
+template <chip CHIP>
+static struct tu_mesh_cmd_cost
+tu_mesh_draw_cost(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
+{
+   const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+   const struct tu_shader *ts = cmd->state.shaders[MESA_SHADER_TASK];
+   const struct tu_shader *setup = cmd->device->mesh_setup;
+   uint64_t ms_data, ts_data = 0, setup_data;
+   uint64_t ms_dispatch = tu_mesh_dispatch_dwords<CHIP>(cmd, ms, &ms_data);
+   uint64_t ts_dispatch = ts ? tu_mesh_dispatch_dwords<CHIP>(cmd, ts, &ts_data) : 0;
+   uint64_t setup_dispatch = tu_mesh_dispatch_dwords<CHIP>(cmd, setup, &setup_data);
+   uint64_t clean = 2 + 3 * fd_gpu_events<CHIP>[FD_CACHE_CLEAN].needs_seqno;
+   uint64_t invalidate = 2 + 3 * fd_gpu_events<CHIP>[FD_CACHE_INVALIDATE].needs_seqno;
+   uint64_t barrier = 3 + clean + invalidate;
+   uint64_t cp_barrier = 2 + invalidate;
+   uint64_t ms_barrier = tu_mesh_no_trailing_flush() ? barrier - clean : barrier;
+   uint64_t ms_program = tu_mesh_program_dwords<CHIP>(cmd, ms);
+   uint64_t setup_words = 3 + TU_MESH_PARAM_NUM + cp_barrier +
+      tu_mesh_program_dwords<CHIP>(cmd, setup) + setup_dispatch + barrier;
+   uint64_t parents = draw->indirect ? TU_MESH_MAX_WORKGROUPS :
+      (uint64_t) draw->groups[0] * draw->groups[1] * draw->groups[2];
+   struct tu_mesh_cmd_cost cost = {};
+   if (ts) {
+      uint64_t full = parents / ts->mesh.chunk_workgroups;
+      uint64_t tail = parents % ts->mesh.chunk_workgroups;
+      uint64_t bound = tu_mesh_task_launch_bound(cmd, ts);
+      uint64_t children = MIN2(parents, ts->mesh.chunk_workgroups) * bound;
+      if (children > UINT32_MAX ||
+          DIV_ROUND_UP(children, ms->mesh.chunk_workgroups) > TU_MESH_MAX_CHUNKS)
+         return { UINT64_MAX / 4, 0, 0, 0 };
+      uint64_t task_chunks = full + (tail != 0);
+      cost.chunks = full * DIV_ROUND_UP(ts->mesh.chunk_workgroups * bound,
+                                       ms->mesh.chunk_workgroups) +
+         DIV_ROUND_UP(tail * bound, ms->mesh.chunk_workgroups);
+      if (draw->indirect)
+         cost.chunks = task_chunks * DIV_ROUND_UP(children, ms->mesh.chunk_workgroups);
+      cost.dwords = task_chunks * (tu_mesh_program_dwords<CHIP>(cmd, ts) +
+         ts_dispatch + barrier + setup_words + (draw->indirect ? 7 + 9 : 0) +
+         ms_program) + cost.chunks * (9 + ms_dispatch + ms_barrier + 4 + 7 + 1);
+      cost.data_dwords = task_chunks * (ts_data + setup_data) + cost.chunks * ms_data;
+      cost.programs = task_chunks * 3;
+      cost.chunks += task_chunks;
+   } else {
+      cost.chunks = DIV_ROUND_UP(parents, ms->mesh.chunk_workgroups);
+      cost.dwords = ms_program + cost.chunks *
+         (ms_dispatch + ms_barrier + 4 + (draw->indirect ? 9 + 7 : 4) + 1);
+      cost.data_dwords = cost.chunks * ms_data;
+      cost.programs = 1;
+   }
+   if (draw->indirect) {
+      cost.dwords += setup_words + (draw->count ? 7 : 0);
+      cost.data_dwords += setup_data;
+      cost.programs++;
+      if (cost.dwords + cost.data_dwords > UINT64_MAX / 4 / draw->draw_count)
+         return { UINT64_MAX / 4, 0, 0, 0 };
+      cost.dwords *= draw->draw_count;
+      cost.data_dwords *= draw->draw_count;
+      cost.programs *= draw->draw_count;
+      cost.chunks *= draw->draw_count;
+   } else {
+      cost.dwords += 4 + 3 + TU_MESH_TABLE_ENTRY_SIZE / 4 + cp_barrier;
+   }
+   return cost;
+}
+
+static bool
+tu_mesh_check_budget(struct tu_cmd_buffer *cmd, uint64_t bytes)
+{
+   static const uint64_t draw_limit =
+      (uint64_t) CLAMP(debug_get_num_option("TU_MESH_CMD_BUDGET_MB", 32), 1, 4096) << 20;
+   static const uint64_t buffer_limit =
+      (uint64_t) CLAMP(debug_get_num_option("TU_MESH_CB_BUDGET_MB", 64), 1, 4096) << 20;
+   if (bytes <= draw_limit && cmd->mesh_stats.bytes <= buffer_limit &&
+       bytes <= buffer_limit - cmd->mesh_stats.bytes)
+      return true;
+   if (!cmd->mesh_stats.rejected++)
+      mesa_logw("mesh command budget: draw=%" PRIu64 " accumulated=%" PRIu64
+                " draw_limit=%" PRIu64 " buffer_limit=%" PRIu64,
+                bytes, cmd->mesh_stats.bytes, draw_limit, buffer_limit);
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   return false;
+}
+
 /* Runs one chunk of the task table, then the mesh workgroups it launched. */
 template <chip CHIP>
 static void
@@ -10556,21 +10735,15 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    const struct tu_shader *ts = cmd->state.shaders[MESA_SHADER_TASK];
    const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
 
-   if (ts) {
-      uint64_t parents = draw->indirect ? TU_MESH_MAX_WORKGROUPS :
-         (uint64_t) draw->groups[0] * draw->groups[1] * draw->groups[2];
-      uint64_t children = MIN2(parents, ts->mesh.chunk_workgroups) *
-                          tu_mesh_task_launch_bound(cmd, ts);
-      uint64_t chunks = DIV_ROUND_UP(children, ms->mesh.chunk_workgroups);
-      uint64_t commands = DIV_ROUND_UP(parents, ts->mesh.chunk_workgroups) * chunks;
-      if (draw->indirect)
-         commands *= draw->draw_count;
-      if (children > UINT32_MAX || chunks > TU_MESH_MAX_CHUNKS ||
-          commands > (1u << 18)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-         return;
-      }
-   }
+   if (cmd->vk.record_result != VK_SUCCESS)
+      return;
+
+   struct tu_mesh_cmd_cost cost = tu_mesh_draw_cost<CHIP>(cmd, draw);
+   uint64_t estimated = (cost.dwords + cost.data_dwords) * 4;
+   if (!tu_mesh_check_budget(cmd, estimated > UINT64_MAX - 65536 ?
+                                  UINT64_MAX : estimated + 65536))
+      return;
+   uint64_t before = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs);
 
    if (draw->indirect)
       tu6_emit_empty_vs_params<CHIP>(cmd);
@@ -10578,6 +10751,9 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
       tu6_emit_vs_params(cmd, 0, 0, 0);
 
    tu6_draw_common<CHIP>(cmd, cs, false, 0);
+
+   uint64_t common_bytes = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs) - before;
+   before = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs);
 
    cmd->state.rp.has_mesh = true;
    cmd->state.compute_program_stale = true;
@@ -10641,6 +10817,22 @@ tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
          }
       }
    }
+
+   if (tu_cs_get_status(cs) != VK_SUCCESS || tu_cs_get_status(&cmd->sub_cs) != VK_SUCCESS)
+      return;
+   uint64_t actual = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs) - before;
+   cmd->mesh_stats.draws++;
+   cmd->mesh_stats.chunks += cost.chunks;
+   cmd->mesh_stats.programs += cost.programs;
+   cmd->mesh_stats.bytes += actual + common_bytes;
+   cmd->mesh_stats.estimated_bytes += estimated + common_bytes;
+   cmd->mesh_stats.max_record_bytes = MAX2(cmd->mesh_stats.max_record_bytes,
+      (uint64_t) ms->mesh.stride * ms->mesh.chunk_workgroups);
+   if (TU_DEBUG(MESH))
+      mesa_logi("mesh draw estimated=%" PRIu64 " actual=%" PRIu64
+                " common=%" PRIu64, estimated, actual, common_bytes);
+   if (tu_cs_get_status(cs) == VK_SUCCESS)
+      assert(actual <= estimated + 4096);
 
    trace_end_draw(&cmd->rp_trace, cs);
 }
@@ -11027,6 +11219,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
          VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
          VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
          VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT |
+         VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
          VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |

@@ -19,6 +19,7 @@
 #include "tu_pass.h"
 
 static const struct debug_control tu_debug_options[] = {
+   { "mesh", TU_DEBUG_MESH },
    { "startup", TU_DEBUG_STARTUP },
    { "nir", TU_DEBUG_NIR },
    { "nobin", TU_DEBUG_NOBIN },

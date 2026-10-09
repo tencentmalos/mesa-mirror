@@ -714,6 +714,16 @@ struct tu_cmd_buffer
 
    struct tu_device *device;
 
+   struct {
+      uint64_t draws;
+      uint64_t chunks;
+      uint64_t programs;
+      uint64_t bytes;
+      uint64_t estimated_bytes;
+      uint64_t max_record_bytes;
+      uint32_t rejected;
+   } mesh_stats;
+
    bool deferred_recording;
    bool deferred_replaying;
    void *fdm_snapshots_ctx;
