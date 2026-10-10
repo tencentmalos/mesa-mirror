@@ -84,6 +84,11 @@ lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *)
       nir_def_replace(&intr->def, value);
       return true;
    }
+   if (intr->intrinsic == nir_intrinsic_load_draw_id) {
+      nir_def_replace(&intr->def, nir_load_global(b, 1, 32,
+         aqe_address(b, 2, nir_imm_int(b, 0)), .align_mul = 4));
+      return true;
+   }
    if (intr->intrinsic == nir_intrinsic_load_base_workgroup_id) {
       nir_def_replace(&intr->def, nir_imm_zero(b, 3, intr->def.bit_size));
       return true;
@@ -138,6 +143,7 @@ tu_aqe_lower_mesh(nir_shader *ms)
             case nir_intrinsic_load_local_invocation_id:
             case nir_intrinsic_load_local_invocation_index:
             case nir_intrinsic_load_num_workgroups:
+            case nir_intrinsic_load_draw_id:
             case nir_intrinsic_load_workgroup_size:
             case nir_intrinsic_set_vertex_and_primitive_count:
             case nir_intrinsic_barrier:

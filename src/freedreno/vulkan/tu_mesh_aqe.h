@@ -5,6 +5,7 @@
 
 #define TU_AQE_HEADER_DWORDS 26
 #define TU_AQE_PACKET_DWORDS 32
+#define TU_AQE_INDIRECT_PACKET_DWORDS 31
 #define TU_AQE_CONSTANT_VEC4S 5
 
 enum tu_aqe_region {
@@ -41,6 +42,7 @@ struct tu_aqe_triangle_draw {
    uint32_t state_offset;
    uint32_t state_dwords;
    uint32_t groups[3];
+   struct tu_aqe_bo indirect;
 };
 
 bool tu_aqe_triangle_layout(uint32_t mesh_capacity, uint32_t task_capacity,

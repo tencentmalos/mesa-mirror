@@ -79,14 +79,21 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
        draw->parameters.iova < draw->arena.iova + draw->arena.size)
       return false;
 
-   uint64_t total = 1;
-   for (unsigned i = 0; i < 3; i++) {
-      if (!draw->groups[i] || draw->groups[i] > 65535)
+   if (draw->indirect.iova) {
+      if (!valid_bo(&draw->indirect, 4) || draw->indirect.size < 12)
          return false;
-      total *= draw->groups[i];
+   } else {
+      if (draw->indirect.size)
+         return false;
+      uint64_t total = 1;
+      for (unsigned i = 0; i < 3; i++) {
+         if (!draw->groups[i] || draw->groups[i] > 65535)
+            return false;
+         total *= draw->groups[i];
+      }
+      if (total > (1u << 22))
+         return false;
    }
-   if (total > (1u << 22))
-      return false;
 
    uint32_t h[TU_AQE_HEADER_DWORDS] = {};
    uint32_t p[TU_AQE_PACKET_DWORDS] = {};
@@ -114,6 +121,13 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
       const struct tu_aqe_span *span = &layout->regions[order[i]];
       write_address(p + 11 + i * 3, draw->arena.iova + span->offset);
       p[13 + i * 3] = span->size;
+   }
+   if (draw->indirect.iova) {
+      p[0] = 0x707a801e;
+      p[1] = 7;
+      write_address(p + 2, draw->indirect.iova);
+      memmove(p + 4, p + 5, (TU_AQE_PACKET_DWORDS - 5) * 4);
+      p[TU_AQE_INDIRECT_PACKET_DWORDS] = 0;
    }
    memcpy(header, h, sizeof(h));
    memcpy(packet, p, sizeof(p));

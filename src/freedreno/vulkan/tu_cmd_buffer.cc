@@ -10894,35 +10894,33 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    struct tu_aqe_stage stage;
    struct tu_aqe_layout layout;
    struct tu_aqe_bo binary = { ms->binary_iova, ms->variant->info.size };
-   if (CHIP != A8XX || !arena || draw->indirect || cmd->state.vk_mv.view_mask ||
+   const uint32_t draws = draw->indirect ? draw->draw_count : 1;
+   const uint64_t address_limit = 1ull << 49;
+   const uint64_t indirect_bytes = uint64_t(draws ? draws - 1 : 0) * draw->stride + 12;
+   if (draw->count && !debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE_COUNT", false)) {
+      mesa_loge("Native AQE count requires separate experimental opt-in");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (CHIP != A8XX || !arena || cmd->state.vk_mv.view_mask ||
+       !draws || draws >= (1u << 31) ||
+       (draw->indirect && (draw->indirect % 4 || draw->indirect >= address_limit ||
+          indirect_bytes > address_limit - draw->indirect ||
+          (draws > 1 && (draw->stride < 12 || draw->stride % 4)))) ||
+       (draw->count && (!draw->indirect || draw->count % 4 ||
+          draw->count > address_limit - 4)) ||
        !tu_aqe_triangle_layout(256, 256, &layout) ||
        !tu_aqe_build_triangle_stage(ms->variant, &binary, &stage)) {
       mesa_loge("AQE draw rejected before submission");
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   struct tu_cs_memory parameters;
-   unsigned dwords = TU_AQE_HEADER_DWORDS + stage.dwords;
-   VkResult result = tu_cs_alloc(&cmd->sub_cs, dwords, 1, &parameters);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
+   const uint64_t estimated = uint64_t(draws) * 512 + 65536;
+   if (!tu_mesh_check_budget(cmd, estimated))
       return;
-   }
-   struct tu_aqe_triangle_draw aqe = {
-      .arena = { arena->iova, arena->size },
-      .parameters = { parameters.iova, dwords * 4ull },
-      .state_offset = TU_AQE_HEADER_DWORDS * 4,
-      .state_dwords = stage.dwords,
-      .groups = { draw->groups[0], draw->groups[1], draw->groups[2] },
-   };
-   uint32_t packet[TU_AQE_PACKET_DWORDS];
-   if (!tu_aqe_build_triangle(&aqe, &layout, parameters.map, packet)) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
-   }
-   memcpy(parameters.map + TU_AQE_HEADER_DWORDS, stage.words, stage.dwords * 4);
 
    struct tu_cs *cs = &cmd->draw_cs;
+   const uint64_t before = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs);
    cmd->state.rp.has_mesh = true;
    tu6_emit_vs_params(cmd, 0, 0, 0);
    tu6_draw_common<CHIP>(cmd, cs, true, 0);
@@ -10940,18 +10938,82 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + TU_DYNAMIC_STATE_VERTEX_INPUT, input);
    tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + TU_DYNAMIC_STATE_VB_STRIDE, {});
    tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VB, {});
-   tu_cs_reserve(cs, TU_AQE_PACKET_DWORDS);
-   tu_cs_emit_array(cs, packet, TU_AQE_PACKET_DWORDS);
-   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+   const uint64_t draw_data = arena->iova + layout.regions[TU_AQE_TASK_PAYLOAD].offset;
+   const uint64_t count_bool = draw_data + 4;
+   const uint64_t count_value = draw_data + 8;
+   if (draw->count) {
+      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
+      tu_cs_emit_qw(cs, count_bool);
+      tu_cs_emit(cs, 1);
+      tu_cs_emit(cs, 0);
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+      tu_cs_emit(cs, 0);
+      tu_cs_emit_qw(cs, count_value);
+      tu_cs_emit_qw(cs, draw->count);
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      cs->cond_write(tu_gpuva(count_value), tu_gpuva(count_value), {
+         .function = WRITE_GE, .ref = draws, .write_data = draws,
+      });
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   }
+   for (uint32_t i = 0; i < draws; i++) {
+      struct tu_cs_memory parameters;
+      unsigned dwords = TU_AQE_HEADER_DWORDS + stage.dwords;
+      VkResult result = tu_cs_alloc(&cmd->sub_cs, dwords, 1, &parameters);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+      struct tu_aqe_triangle_draw aqe = {
+         .arena = { arena->iova, arena->size },
+         .parameters = { parameters.iova, dwords * 4ull },
+         .state_offset = TU_AQE_HEADER_DWORDS * 4,
+         .state_dwords = stage.dwords,
+         .groups = { draw->groups[0], draw->groups[1], draw->groups[2] },
+         .indirect = draw->indirect ?
+            tu_aqe_bo{draw->indirect + uint64_t(i) * draw->stride, 12} : tu_aqe_bo{},
+      };
+      uint32_t packet[TU_AQE_PACKET_DWORDS];
+      if (!tu_aqe_build_triangle(&aqe, &layout, parameters.map, packet)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      memcpy(parameters.map + TU_AQE_HEADER_DWORDS, stage.words, stage.dwords * 4);
+      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
+      tu_cs_emit_qw(cs, draw_data);
+      tu_cs_emit(cs, i);
+      tu_mesh_emit_cp_barrier<CHIP>(cmd, cs);
+      unsigned packet_dwords = draw->indirect ? TU_AQE_INDIRECT_PACKET_DWORDS :
+                                               TU_AQE_PACKET_DWORDS;
+      if (draw->count) {
+         tu_cs_emit_pkt7(cs, CP_COND_EXEC, 6);
+         tu_cs_emit_qw(cs, count_bool);
+         tu_cs_emit_qw(cs, count_value);
+         tu_cs_emit(cs, i);
+         tu_cs_emit(cs, 1);
+         tu_cs_emit_pkt7(cs, CP_NOP, packet_dwords);
+      }
+      tu_cs_reserve(cs, packet_dwords);
+      tu_cs_emit_array(cs, packet, packet_dwords);
+      tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+   }
    tu_cs_emit_regs(cs, VPC_UNKNOWN_CNTL(CHIP, 0));
    cmd->state.compute_program_stale = true;
    cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS | TU_CMD_DIRTY_DRAW_STATE;
    cmd->mesh_stats.draws++;
-   cmd->mesh_stats.chunks += DIV_ROUND_UP(
-      draw->groups[0] * draw->groups[1] * draw->groups[2], layout.mesh_capacity);
+   if (!draw->indirect)
+      cmd->mesh_stats.chunks += DIV_ROUND_UP(
+         draw->groups[0] * draw->groups[1] * draw->groups[2], layout.mesh_capacity);
+   const uint64_t actual = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs) - before;
+   cmd->mesh_stats.bytes += actual;
+   cmd->mesh_stats.estimated_bytes += estimated;
+   if (tu_cs_get_status(cs) == VK_SUCCESS)
+      assert(actual <= estimated);
    if (TU_DEBUG(MESH))
-      fprintf(stderr, "mesh backend=native-aqe packet=0x7a groups=%u,%u,%u stage_dwords=%u\n",
-                draw->groups[0], draw->groups[1], draw->groups[2], stage.dwords);
+      fprintf(stderr, "mesh backend=native-aqe packet=0x7a groups=%u,%u,%u stage_dwords=%u mode=%u draws=%u counted=%u\n",
+                draw->groups[0], draw->groups[1], draw->groups[2], stage.dwords,
+                draw->indirect ? 7 : 5, draws, !!draw->count);
    trace_end_draw(&cmd->rp_trace, cs);
 }
 

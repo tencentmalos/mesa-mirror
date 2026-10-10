@@ -76,6 +76,16 @@ test_packet(const char *directory)
    CHECK(p[0] == 0x707a001f && p[1] == 5);
    CHECK(p[7] == 0x40 && p[8] == 0 && p[9] == 256 && p[10] == 256);
    CHECK(address(p + 5) == d.parameters.iova);
+   uint32_t direct[TU_AQE_PACKET_DWORDS];
+   memcpy(direct, p, sizeof(p));
+   d.indirect = {0x345600000000ull, 12};
+   CHECK(tu_aqe_build_triangle(&d, &layout, h, p));
+   CHECK(p[0] == pm4_pkt7_hdr(0x7a, TU_AQE_INDIRECT_PACKET_DWORDS - 1));
+   CHECK(p[1] == 7 && address(p + 2) == d.indirect.iova);
+   CHECK(!memcmp(p + 4, direct + 5, (TU_AQE_PACKET_DWORDS - 5) * 4));
+   CHECK(p[TU_AQE_INDIRECT_PACKET_DWORDS] == 0);
+   d.indirect = {};
+   CHECK(tu_aqe_build_triangle(&d, &layout, h, p));
    const unsigned offsets[] = {0x184000, 0, 0x988000, 0x98e000,
                                0x180000, 0x185000, 0x985000};
    const unsigned sizes[] = {0x1000, 0x180000, 0x6000, 0, 0x4000, 0x800000, 0x3000};
@@ -113,6 +123,10 @@ test_packet(const char *directory)
    d.groups[0] = 0; reject();
    d.groups[0] = 65536; reject();
    d.groups[0] = UINT32_MAX; reject();
+   d.indirect = {0x345600000001ull, 12}; reject();
+   d.indirect = {(1ull << 49) - 4, 12}; reject();
+   d.indirect = {0, 12}; reject();
+   d.indirect = {0x345600000000ull, 11}; reject();
    const uint32_t dimensions[][3] = {
       {255, 1, 1}, {256, 1, 1}, {257, 1, 1}, {17, 17, 3},
       {65535, 3, 1}, {16384, 256, 1},
@@ -238,7 +252,8 @@ test_lowering(ir3_compiler *compiler)
       nir_vec4(&b, nir_u2f32(&b, nir_channel(&b, group, 0)),
                nir_u2f32(&b, nir_channel(&b, group, 1)),
                nir_u2f32(&b, nir_channel(&b, group, 2)),
-               nir_u2f32(&b, nir_channel(&b, dimensions, 2))), 0xf);
+               nir_u2f32(&b, nir_iadd(&b, nir_channel(&b, dimensions, 2),
+                                     nir_load_draw_id(&b)))), 0xf);
    nir_pop_if(&b, NULL);
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_store_array_var_imm(&b, idx, 0, nir_imm_ivec3(&b, 2, 0, 1), 7);
@@ -264,6 +279,7 @@ test_lowering(ir3_compiler *compiler)
             CHECK(intr->intrinsic != nir_intrinsic_set_vertex_and_primitive_count);
             CHECK(intr->intrinsic != nir_intrinsic_store_deref);
             CHECK(intr->intrinsic != nir_intrinsic_load_base_workgroup_id);
+            CHECK(intr->intrinsic != nir_intrinsic_load_draw_id);
             if (intr->intrinsic == nir_intrinsic_store_global) {
                stores++;
                index_stores += intr->src[0].ssa->bit_size == 16;
