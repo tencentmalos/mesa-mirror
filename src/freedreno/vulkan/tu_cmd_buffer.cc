@@ -2368,6 +2368,25 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
       .constlen = 8,
       .enabled = true,
    ));
+
+   if (CHIP >= A7XX) {
+      tu_cs_emit_regs(cs, GRAS_BIN_FOVEAT(CHIP));
+      tu_cs_emit_regs(cs, RB_BIN_FOVEAT(CHIP));
+      if (CHIP >= A8XX) {
+         for (unsigned i = 0; i < MAX_HW_SCALED_VIEWS; i++) {
+            tu_cs_emit_regs(cs, GRAS_BIN_FOVEAT_XY_OFFSET(CHIP, i, .xoffset = 0, .yoffset = 0));
+            tu_cs_emit_regs(cs, RB_BIN_FOVEAT_XY_OFFSET(CHIP, i, .xoffset = 0, .yoffset = 0));
+            tu_cs_emit_regs(cs, GRAS_BIN_FOVEAT_XY_FDM_OFFSET(CHIP, i, .xoffset = 0, .yoffset = 0));
+            tu_cs_emit_regs(cs, RB_BIN_FOVEAT_XY_FDM_OFFSET(CHIP, i, .xoffset = 0, .yoffset = 0));
+         }
+      } else {
+         tu_cs_emit_regs(cs,
+            GRAS_BIN_FOVEAT_OFFSET_0(CHIP, .xoffset_0 = 0, .xoffset_1 = 0, .xoffset_2 = 0),
+            GRAS_BIN_FOVEAT_OFFSET_1(CHIP, .xoffset_3 = 0, .xoffset_4 = 0, .xoffset_5 = 0),
+            GRAS_BIN_FOVEAT_OFFSET_2(CHIP, .yoffset_0 = 0, .yoffset_1 = 0, .yoffset_2 = 0),
+            GRAS_BIN_FOVEAT_OFFSET_3(CHIP, .yoffset_3 = 0, .yoffset_4 = 0, .yoffset_5 = 0));
+      }
+   }
 }
 
 /* Emit the bin restore preamble, which runs in between bins when L1
