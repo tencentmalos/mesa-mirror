@@ -3913,17 +3913,22 @@ tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
                        bool multiview, bool aqe)
 {
    nir_shader *ms = nir[MESA_SHADER_MESH];
+   const uint16_t max_vertices = ms->info.mesh.max_vertices_out;
+   const uint16_t max_primitives = ms->info.mesh.max_primitives_out;
+   const uint8_t verts_per_prim = ms->info.mesh.primitive_type == MESA_PRIM_TRIANGLES ? 3 :
+      ms->info.mesh.primitive_type == MESA_PRIM_LINES ? 2 : 1;
    if (aqe && !queries && !multiview && !nir[MESA_SHADER_TASK] &&
        tu_aqe_lower_mesh(ms)) {
       nir[MESA_SHADER_VERTEX] =
-         tu_aqe_build_vs(ir3_get_compiler_options(dev->compiler));
+         tu_aqe_build_vs(ir3_get_compiler_options(dev->compiler), verts_per_prim == 1);
       ralloc_steal(mem_ctx, nir[MESA_SHADER_VERTEX]);
       info[MESA_SHADER_MESH].mesh = (struct tu_mesh_state) {
-         .stride = 48,
+         .stride = uint32_t(max_vertices) * 16,
          .chunk_workgroups = 256,
-         .max_primitives = 1,
-         .verts_per_prim = 3,
-         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+         .max_primitives = max_primitives,
+         .verts_per_prim = verts_per_prim,
+         .topology = uint8_t(verts_per_prim == 3 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST :
+            verts_per_prim == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_POINT_LIST),
          .native_aqe = true,
       };
       return;

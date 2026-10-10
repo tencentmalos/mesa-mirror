@@ -55,7 +55,7 @@ int main()
    dev.vk.alloc.pfnFree = free_sync;
    struct tu_aqe_resources a = {}, b = {}, secondary = {};
    struct tu_aqe_layout layout;
-   CHECK(tu_aqe_triangle_layout(256, 256, &layout));
+   CHECK(tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, 256, 256, &layout));
    allocation_fails = true;
    CHECK(tu_aqe_resources_require(&dev, &a, layout.size) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
    CHECK(!a.arena);
@@ -68,6 +68,16 @@ int main()
    auto *original = a.arena;
    CHECK(tu_aqe_resources_require(&dev, &a, layout.size) == VK_SUCCESS);
    CHECK(a.arena == original && allocated == 3);
+
+   uint32_t address[2] = {};
+   tu_aqe_resources_relocate(&a, address, 128);
+   allocation_fails = true;
+   CHECK(tu_aqe_resources_require(&dev, &a, layout.size * 2) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   CHECK(a.arena == original && !address[0] && !address[1]);
+   allocation_fails = false;
+   CHECK(tu_aqe_resources_require(&dev, &a, layout.size * 2) == VK_SUCCESS);
+   CHECK(a.arena != original && allocated == 4 && released == 1);
+   CHECK((address[0] | (uint64_t(address[1]) << 32)) == a.arena->iova + 128);
 
    tu_aqe_resources_add_secondary(&a, &secondary);
    tu_aqe_resources_add_secondary(&b, &secondary);
@@ -84,10 +94,10 @@ int main()
    completion->sync->type = &sync_type;
    a.last_submission = b.last_submission = completion;
    tu_aqe_resources_finish(&dev, &a);
-   CHECK(!a.arena && !a.last_submission && !a.secondaries.size);
-   CHECK(released == 1 && syncs_released == 0 && secondary.arena);
+   CHECK(!a.arena && !a.last_submission && !a.secondaries.size && !a.relocations.size);
+   CHECK(released == 2 && syncs_released == 0 && secondary.arena);
    CHECK(tu_aqe_resources_require(&dev, &a, layout.size) == VK_SUCCESS);
-   CHECK(allocated == 4 && a.arena->iova >= secondary.arena->iova + secondary.arena->size);
+   CHECK(allocated == 5 && a.arena->iova >= secondary.arena->iova + secondary.arena->size);
    tu_aqe_resources_finish(&dev, &b);
    CHECK(syncs_released == 1 && secondary.arena);
    tu_aqe_resources_finish(&dev, &secondary);

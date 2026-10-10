@@ -24,11 +24,22 @@ struct tu_aqe_span {
    uint32_t size;
 };
 
+enum tu_aqe_topology {
+   TU_AQE_TRIANGLES,
+   TU_AQE_LINES,
+   TU_AQE_POINTS,
+};
+
 struct tu_aqe_layout {
    struct tu_aqe_span regions[TU_AQE_REGION_COUNT];
    uint32_t size;
    uint32_t mesh_capacity;
    uint32_t task_capacity;
+   uint32_t max_vertices;
+   uint32_t max_primitives;
+   enum tu_aqe_topology topology;
+   uint32_t vertex_stride;
+   uint32_t index_stride;
 };
 
 struct tu_aqe_bo {
@@ -53,8 +64,10 @@ struct tu_aqe_triangle_draw {
    struct tu_aqe_bo metadata;
 };
 
-bool tu_aqe_triangle_layout(uint32_t mesh_capacity, uint32_t task_capacity,
-                            struct tu_aqe_layout *layout);
+bool tu_aqe_layout_for(uint32_t max_vertices, uint32_t max_primitives,
+                       enum tu_aqe_topology topology, uint32_t vertex_stride,
+                       uint32_t mesh_capacity, uint32_t task_capacity,
+                       struct tu_aqe_layout *layout);
 bool tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
                            const struct tu_aqe_layout *layout,
                            uint32_t header[TU_AQE_HEADER_DWORDS],

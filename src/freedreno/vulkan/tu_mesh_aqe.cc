@@ -16,23 +16,35 @@ append_region(struct tu_aqe_layout *layout, enum tu_aqe_region region,
 }
 
 bool
-tu_aqe_triangle_layout(uint32_t mesh_capacity, uint32_t task_capacity,
-                        struct tu_aqe_layout *layout)
+tu_aqe_layout_for(uint32_t max_vertices, uint32_t max_primitives,
+                   enum tu_aqe_topology topology, uint32_t vertex_stride,
+                   uint32_t mesh_capacity, uint32_t task_capacity,
+                   struct tu_aqe_layout *layout)
 {
    if (!layout || !mesh_capacity || mesh_capacity > 256 ||
-       !task_capacity || task_capacity > 256)
+       !task_capacity || task_capacity > 256 ||
+       !max_vertices || max_vertices > 128 ||
+       !max_primitives || max_primitives > 64 ||
+       topology < TU_AQE_TRIANGLES || topology > TU_AQE_POINTS ||
+       vertex_stride < 16 || vertex_stride % 16)
       return false;
 
    struct tu_aqe_layout result = {};
    result.mesh_capacity = mesh_capacity;
    result.task_capacity = task_capacity;
+   result.max_vertices = max_vertices;
+   result.max_primitives = max_primitives;
+   result.topology = topology;
+   result.vertex_stride = vertex_stride;
+   uint32_t indices = max_primitives * (topology == TU_AQE_POINTS ? 1u : 4u - topology);
+   result.index_stride = ((indices + 3) & ~3u) * 2;
    uint64_t n = 256ull * mesh_capacity;
    if (!append_region(&result, TU_AQE_INDICES, 24 * n) ||
        !append_region(&result, TU_AQE_AUXILIARY, (n >> 2) & ~1ull) ||
        !append_region(&result, TU_AQE_COUNTS, 16ull * mesh_capacity) ||
        !append_region(&result, TU_AQE_TASK_PAYLOAD, 2ull * task_capacity * 16384) ||
        !append_region(&result, TU_AQE_TASK_RECORDS, 48ull * task_capacity) ||
-       !append_region(&result, TU_AQE_OUTPUT0, 96ull * mesh_capacity) ||
+       !append_region(&result, TU_AQE_OUTPUT0, 2ull * mesh_capacity * max_vertices * vertex_stride) ||
        !append_region(&result, TU_AQE_OUTPUT1, 0))
       return false;
    *layout = result;
@@ -63,8 +75,9 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
    if (!draw || !layout || !header || !packet)
       return false;
    struct tu_aqe_layout expected;
-   if (!tu_aqe_triangle_layout(layout->mesh_capacity, layout->task_capacity,
-                               &expected) ||
+   if (!tu_aqe_layout_for(layout->max_vertices, layout->max_primitives,
+                          layout->topology, layout->vertex_stride,
+                          layout->mesh_capacity, layout->task_capacity, &expected) ||
        memcmp(layout, &expected, sizeof(expected)) ||
        !valid_bo(&draw->arena, 32) || !valid_bo(&draw->parameters, 4) ||
        draw->arena.size < layout->size ||
@@ -108,10 +121,11 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
    uint32_t p[TU_AQE_PACKET_DWORDS] = {};
    write_address(h + 4, draw->parameters.iova + draw->state_offset);
    h[6] = draw->state_dwords;
-   h[7] = 4;
-   h[9] = 48;
-   h[15] = 3;
-   h[16] = 1;
+   h[0] = layout->topology << 5;
+   h[7] = layout->index_stride / 2;
+   h[9] = layout->max_vertices * layout->vertex_stride;
+   h[15] = layout->max_vertices;
+   h[16] = layout->max_primitives;
    h[17] = 1;
    h[19] = 0x7d;
 

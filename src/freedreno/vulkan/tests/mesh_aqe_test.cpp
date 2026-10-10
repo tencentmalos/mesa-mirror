@@ -24,12 +24,28 @@ static void
 test_layout()
 {
    tu_aqe_layout l;
-   CHECK(!tu_aqe_triangle_layout(0, 256, &l));
-   CHECK(!tu_aqe_triangle_layout(257, 256, &l));
-   CHECK(!tu_aqe_triangle_layout(UINT32_MAX, 256, &l));
-   CHECK(!tu_aqe_triangle_layout(256, UINT32_MAX, &l));
+   CHECK(!tu_aqe_layout_for(0, 1, TU_AQE_TRIANGLES, 16, 256, 256, &l));
+   CHECK(!tu_aqe_layout_for(129, 1, TU_AQE_TRIANGLES, 16, 256, 256, &l));
+   CHECK(!tu_aqe_layout_for(128, 65, TU_AQE_TRIANGLES, 16, 256, 256, &l));
+   CHECK(!tu_aqe_layout_for(128, 64, TU_AQE_TRIANGLES, UINT32_MAX - 15, 256, 256, &l));
+   CHECK(!tu_aqe_layout_for(128, 64, TU_AQE_TRIANGLES, 17, 256, 256, &l));
+   CHECK(!tu_aqe_layout_for(3, 1, (tu_aqe_topology)3, 16, 256, 256, &l));
+   for (auto topology : {TU_AQE_TRIANGLES, TU_AQE_LINES, TU_AQE_POINTS}) {
+      for (unsigned v : {1u, 3u, 4u, 64u, 128u}) {
+         for (unsigned p : {1u, 2u, 64u}) {
+            CHECK(tu_aqe_layout_for(v, p, topology, 16, 256, 256, &l));
+            CHECK(l.regions[TU_AQE_OUTPUT0].size == 2 * 256 * v * 16);
+            unsigned elements = topology == TU_AQE_POINTS ? 1 : 4u - topology;
+            CHECK(l.index_stride == ((p * elements + 3) & ~3u) * 2);
+         }
+      }
+   }
+   CHECK(!tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, 0, 256, &l));
+   CHECK(!tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, 257, 256, &l));
+   CHECK(!tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, UINT32_MAX, 256, &l));
+   CHECK(!tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, 256, UINT32_MAX, &l));
    for (unsigned k = 1; k <= 256; k++) {
-      CHECK(tu_aqe_triangle_layout(k, 256, &l));
+      CHECK(tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, k, 256, &l));
       uint64_t end = 0;
       for (const auto &r : l.regions) {
          CHECK(r.offset == end);
@@ -54,7 +70,7 @@ static void
 test_packet(const char *directory)
 {
    tu_aqe_layout layout;
-   CHECK(tu_aqe_triangle_layout(256, 256, &layout));
+   CHECK(tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, 256, 256, &layout));
    tu_aqe_triangle_draw d = {
       .arena = {0x123400000000ull, layout.size},
       .parameters = {0x234500000000ull, 4096},
@@ -184,7 +200,7 @@ test_stage(const ir3_shader_variant *v, const char *directory)
    CHECK(reg(0xa9b9) == 0 && reg(0xa9bd) == 0);
 
    tu_aqe_layout layout;
-   CHECK(tu_aqe_triangle_layout(256, 256, &layout));
+   CHECK(tu_aqe_layout_for(3, 1, TU_AQE_TRIANGLES, 16, 256, 256, &layout));
    tu_aqe_triangle_draw draw = {
       .arena = {0x123400000000ull, layout.size},
       .parameters = {0x234500000000ull, 4 * (TU_AQE_HEADER_DWORDS + stage.dwords)},
@@ -274,10 +290,30 @@ test_lowering(ir3_compiler *compiler)
    nir_pop_if(&b, NULL);
 
    NIR_PASS(_, b.shader, nir_lower_system_values);
-   b.shader->info.mesh.max_vertices_out = 4;
+   b.shader->info.mesh.max_vertices_out = 129;
    CHECK(!tu_aqe_lower_mesh(b.shader));
    CHECK(b.shader->info.stage == MESA_SHADER_MESH);
    b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 65;
+   CHECK(!tu_aqe_lower_mesh(b.shader));
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLE_STRIP;
+   CHECK(!tu_aqe_lower_mesh(b.shader));
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+   b.shader->info.shared_size = 4;
+   CHECK(!tu_aqe_lower_mesh(b.shader));
+   b.shader->info.shared_size = 0;
+   b.shader->info.num_ssbos = 1;
+   CHECK(!tu_aqe_lower_mesh(b.shader));
+   b.shader->info.num_ssbos = 0;
+   nir_shader *bad_point_size = nir_shader_clone(NULL, b.shader);
+   nir_builder bad = nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(bad_point_size)->body));
+   nir_variable *ps = nir_variable_create(bad_point_size, nir_var_shader_out,
+      glsl_array_type(glsl_float_type(), 3, 0), "point_size");
+   ps->data.location = VARYING_SLOT_PSIZ;
+   nir_store_array_var_imm(&bad, ps, 0, nir_imm_float(&bad, 2.0f), 1);
+   CHECK(!tu_aqe_lower_mesh(bad_point_size));
+   ralloc_free(bad_point_size);
    pos->data.location = VARYING_SLOT_VAR0;
    CHECK(!tu_aqe_lower_mesh(b.shader));
    pos->data.location = VARYING_SLOT_POS;

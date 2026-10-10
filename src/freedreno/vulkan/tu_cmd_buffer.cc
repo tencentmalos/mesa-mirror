@@ -10909,7 +10909,9 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
           (draws > 1 && (draw->stride < 12 || draw->stride % 4)))) ||
        (draw->count && (!draw->indirect || draw->count % 4 ||
           draw->count > address_limit - 4)) ||
-       !tu_aqe_triangle_layout(256, 256, &layout) ||
+       !tu_aqe_layout_for(ms->mesh.stride / 16, ms->mesh.max_primitives,
+                          (enum tu_aqe_topology) (3 - ms->mesh.verts_per_prim),
+                          16, 256, 256, &layout) ||
        !tu_aqe_build_triangle_stage(ms->variant, &binary, &stage)) {
       mesa_loge("AQE draw rejected before submission");
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -10949,20 +10951,30 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    const uint64_t draw_data = arena->iova + layout.regions[TU_AQE_TASK_PAYLOAD].offset;
    const uint64_t count_bool = draw_data + 4;
    const uint64_t count_value = draw_data + 8;
+   auto emit_arena_address = [&](uint64_t address) {
+      tu_aqe_resources_relocate(&cmd->mesh_aqe, cs->cur, address - arena->iova);
+      tu_cs_emit_qw(cs, address);
+   };
    if (draw->count) {
       tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
-      tu_cs_emit_qw(cs, count_bool);
+      emit_arena_address(count_bool);
       tu_cs_emit(cs, 1);
       tu_cs_emit(cs, 0);
       tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
       tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
       tu_cs_emit(cs, 0);
-      tu_cs_emit_qw(cs, count_value);
+      emit_arena_address(count_value);
       tu_cs_emit_qw(cs, draw->count);
       tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
-      cs->cond_write(tu_gpuva(count_value), tu_gpuva(count_value), {
-         .function = WRITE_GE, .ref = draws, .write_data = draws,
-      });
+      tu_cs_emit_pkt7(cs, CP_COND_WRITE5, 8);
+      tu_cs_emit(cs, CP_COND_WRITE5_0_FUNCTION(WRITE_GE) |
+                     CP_COND_WRITE5_0_POLL(POLL_MEMORY) |
+                     CP_COND_WRITE5_0_WRITE_MEMORY);
+      emit_arena_address(count_value);
+      tu_cs_emit(cs, draws);
+      tu_cs_emit(cs, UINT32_MAX);
+      emit_arena_address(count_value);
+      tu_cs_emit(cs, draws);
       tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
    }
    for (uint32_t i = 0; i < draws; i++) {
@@ -10998,13 +11010,20 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
                                                TU_AQE_PACKET_DWORDS;
       if (draw->count) {
          tu_cs_emit_pkt7(cs, CP_COND_EXEC, 6);
-         tu_cs_emit_qw(cs, count_bool);
-         tu_cs_emit_qw(cs, count_value);
+         emit_arena_address(count_bool);
+         emit_arena_address(count_value);
          tu_cs_emit(cs, i);
          tu_cs_emit(cs, 1);
          tu_cs_emit_pkt7(cs, CP_NOP, packet_dwords);
       }
       tu_cs_reserve(cs, packet_dwords);
+      for (unsigned region = 0; region < TU_AQE_REGION_COUNT; region++) {
+         if (region == 5)
+            continue;
+         unsigned word = 11 + 3 * region - !!draw->indirect;
+         uint64_t address = packet[word] | (uint64_t(packet[word + 1]) << 32);
+         tu_aqe_resources_relocate(&cmd->mesh_aqe, cs->cur + word, address - arena->iova);
+      }
       tu_cs_emit_array(cs, packet, packet_dwords);
       tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
    }

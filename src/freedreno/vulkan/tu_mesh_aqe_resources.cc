@@ -7,12 +7,31 @@ VkResult
 tu_aqe_resources_require(struct tu_device *dev,
                          struct tu_aqe_resources *resources, uint64_t size)
 {
-   if (resources->arena) {
-      assert(resources->arena->size >= size);
+   if (resources->arena && resources->arena->size >= size)
       return VK_SUCCESS;
+   struct tu_bo *arena;
+   VkResult result = tu_bo_init_new(dev, NULL, &arena, size,
+      TU_BO_ALLOC_INTERNAL_RESOURCE, "command buffer AQE arena");
+   if (result != VK_SUCCESS)
+      return result;
+   util_dynarray_foreach (&resources->relocations, struct tu_aqe_relocation, reloc) {
+      const uint64_t address = arena->iova + reloc->offset;
+      reloc->words[0] = address;
+      reloc->words[1] = address >> 32;
    }
-   return tu_bo_init_new(dev, NULL, &resources->arena, size,
-                         TU_BO_ALLOC_INTERNAL_RESOURCE, "command buffer AQE arena");
+   if (resources->arena)
+      tu_bo_finish(dev, resources->arena);
+   resources->arena = arena;
+   return VK_SUCCESS;
+}
+
+void
+tu_aqe_resources_relocate(struct tu_aqe_resources *resources,
+                          uint32_t *words, uint64_t offset)
+{
+   assert(resources->arena && offset <= resources->arena->size);
+   struct tu_aqe_relocation reloc = {words, offset};
+   util_dynarray_append(&resources->relocations, reloc);
 }
 
 void
@@ -33,6 +52,7 @@ tu_aqe_resources_finish(struct tu_device *dev,
       tu_bo_finish(dev, resources->arena);
    tu_aqe_submission_unref(dev, resources->last_submission);
    util_dynarray_fini(&resources->secondaries);
+   util_dynarray_fini(&resources->relocations);
    *resources = {};
 }
 

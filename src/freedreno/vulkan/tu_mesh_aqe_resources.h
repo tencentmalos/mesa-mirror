@@ -19,7 +19,16 @@ struct tu_aqe_resources {
    struct tu_bo *arena;
    struct tu_aqe_submission *last_submission;
    struct util_dynarray secondaries;
+   struct util_dynarray relocations;
 };
+
+struct tu_aqe_relocation {
+   uint32_t *words;
+   uint64_t offset;
+};
+
+void tu_aqe_resources_relocate(struct tu_aqe_resources *resources,
+                               uint32_t *words, uint64_t offset);
 
 VkResult tu_aqe_resources_require(struct tu_device *dev,
                                   struct tu_aqe_resources *resources,
