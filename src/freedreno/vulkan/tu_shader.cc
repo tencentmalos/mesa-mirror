@@ -22,6 +22,8 @@
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_lrz.h"
+#include "tu_mesh_aqe.h"
+#include "tu_mesh_aqe_nir.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
 #include "tu_sampler.h"
@@ -3290,6 +3292,7 @@ tu_upload_shader(struct tu_device *dev,
    tu_cs_init_suballoc(&shader->cs, dev, &shader->bo);
 
    uint64_t iova = tu_upload_variant(&shader->cs, v);
+   shader->binary_iova = iova;
    uint64_t binning_iova = tu_upload_variant(&shader->cs, binning);
    uint64_t safe_const_iova = tu_upload_variant(&shader->cs, safe_const);
    uint64_t safe_const_binning_iova = tu_upload_variant(&shader->cs, safe_const_binning);
@@ -3704,6 +3707,8 @@ tu_shader_create(struct tu_device *dev,
    }
 
    struct ir3_const_allocations const_allocs = {};
+   if (info->mesh.native_aqe)
+      const_allocs.max_const_offset_vec4 = TU_AQE_CONSTANT_VEC4S;
    NIR_PASS(_, nir, tu_lower_io, dev, shader, api_stage, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
             &const_allocs);
@@ -3903,9 +3908,24 @@ tu6_get_tessmode(const struct nir_shader *shader)
 static void
 tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
                        struct tu_shader_info *info, void *mem_ctx, bool queries,
-                       bool multiview)
+                       bool multiview, bool aqe)
 {
    nir_shader *ms = nir[MESA_SHADER_MESH];
+   if (aqe && !queries && !multiview && !nir[MESA_SHADER_TASK] &&
+       tu_aqe_lower_mesh(ms)) {
+      nir[MESA_SHADER_VERTEX] =
+         tu_aqe_build_vs(ir3_get_compiler_options(dev->compiler));
+      ralloc_steal(mem_ctx, nir[MESA_SHADER_VERTEX]);
+      info[MESA_SHADER_MESH].mesh = (struct tu_mesh_state) {
+         .stride = 48,
+         .chunk_workgroups = 256,
+         .max_primitives = 1,
+         .verts_per_prim = 3,
+         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+         .native_aqe = true,
+      };
+      return;
+   }
    struct tu_mesh_io io;
    tu_mesh_gather_io(ms, &io);
 
@@ -4021,7 +4041,8 @@ tu_compile_shaders(struct tu_device *device,
       }
       tu_lower_mesh_pipeline(device, nir, info, mem_ctx,
                              keys[MESA_SHADER_MESH].mesh_queries,
-                             keys[MESA_SHADER_MESH].multiview_mask != 0);
+                             keys[MESA_SHADER_MESH].multiview_mask != 0,
+                             keys[MESA_SHADER_MESH].mesh_aqe);
    } else if (nir[MESA_SHADER_FRAGMENT]) {
       tu_mesh_lower_fs_inputs(nir[MESA_SHADER_FRAGMENT], false);
    }
@@ -4340,6 +4361,19 @@ tu_init_mesh_shading(struct tu_device *dev)
 
    VkResult result = VK_SUCCESS;
    mtx_lock(&dev->mutex);
+   if (!dev->mesh_aqe_arena &&
+       debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE", false) &&
+       dev->physical_device->aqe_enabled &&
+       dev->physical_device->dev_id.chip_id == 0x44050000) {
+      struct tu_aqe_layout layout;
+      tu_aqe_triangle_layout(256, 256, &layout);
+      result = tu_bo_init_new(dev, NULL, &dev->mesh_aqe_arena, layout.size,
+                              TU_BO_ALLOC_INTERNAL_RESOURCE, "mesh AQE arena");
+      if (result != VK_SUCCESS) {
+         mtx_unlock(&dev->mutex);
+         return result;
+      }
+   }
    if (!dev->mesh_ring) {
       result = tu_bo_init_new(dev, NULL, &dev->mesh_ring, TU_MESH_RING_SIZE,
                               TU_BO_ALLOC_INTERNAL_RESOURCE, "mesh ring");

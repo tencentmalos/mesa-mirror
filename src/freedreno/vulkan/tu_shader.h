@@ -73,6 +73,7 @@ struct tu_shader
    struct tu_suballoc_bo bo;
    struct tu_cs cs;
    struct tu_bo *pvtmem_bo;
+   uint64_t binary_iova;
 
    struct tu_draw_state state;
    struct tu_draw_state safe_const_state;
@@ -149,7 +150,8 @@ struct tu_shader_key {
    bool custom_resolve : 1;
    bool emulate_alpha_to_coverage : 1;
    bool mesh_queries : 1;
-   uint32_t padding : 22;
+   bool mesh_aqe : 1;
+   uint32_t padding : 21;
 
    enum ir3_wavesize_option api_wavesize, real_wavesize;
 

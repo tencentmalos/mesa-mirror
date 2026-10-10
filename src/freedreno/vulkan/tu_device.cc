@@ -3466,6 +3466,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       vk_pipeline_cache_object_unref(&device->vk, &device->mesh_setup->base);
    if (device->mesh_ring)
       tu_bo_finish(device, device->mesh_ring);
+   if (device->mesh_aqe_arena)
+      tu_bo_finish(device, device->mesh_aqe_arena);
 
    tu_destroy_dynamic_rendering(device);
 

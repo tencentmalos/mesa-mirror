@@ -25,6 +25,7 @@
 #include "tu_event.h"
 #include "tu_image.h"
 #include "tu_knl.h"
+#include "tu_mesh_aqe_state.h"
 #include "tu_perfetto.h"
 #include "tu_scratch_ram.h"
 #include "tu_subsampled_image.h"
@@ -3215,7 +3216,10 @@ tu7_emit_concurrent_binning_start(struct tu_cmd_buffer *cmd,
                                   struct tu_cs *cs,
                                   bool disable_cb)
 {
-   if (tu7_cb_disable_reason(disable_cb, cmd, "disable_cb") ||
+   if (tu7_cb_disable_reason(
+          disable_cb || (cmd->device->physical_device->aqe_enabled &&
+                         debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE", false)),
+          cmd, "disable_cb") ||
        /* LRZ can only be cleared via fast clear in BV. Disable CB if we can't
         * use it.
         */
@@ -10883,10 +10887,92 @@ tu_mesh_draw_view(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw,
 
 template <chip CHIP>
 static void
+tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
+{
+   const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+   struct tu_bo *arena = cmd->device->mesh_aqe_arena;
+   struct tu_aqe_stage stage;
+   struct tu_aqe_layout layout;
+   struct tu_aqe_bo binary = { ms->binary_iova, ms->variant->info.size };
+   if (CHIP != A8XX || !arena || draw->indirect || cmd->state.vk_mv.view_mask ||
+       draw->groups[1] != 1 || draw->groups[2] != 1 ||
+       !tu_aqe_triangle_layout(256, 256, &layout) ||
+       !tu_aqe_build_triangle_stage(ms->variant, &binary, &stage)) {
+      mesa_loge("AQE draw rejected before submission");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   struct tu_cs_memory parameters;
+   unsigned dwords = TU_AQE_HEADER_DWORDS + stage.dwords;
+   VkResult result = tu_cs_alloc(&cmd->sub_cs, dwords, 1, &parameters);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   struct tu_aqe_triangle_draw aqe = {
+      .arena = { arena->iova, arena->size },
+      .parameters = { parameters.iova, dwords * 4ull },
+      .state_offset = TU_AQE_HEADER_DWORDS * 4,
+      .state_dwords = stage.dwords,
+      .groups = { draw->groups[0], draw->groups[1], draw->groups[2] },
+   };
+   uint32_t packet[TU_AQE_PACKET_DWORDS];
+   if (!tu_aqe_build_triangle(&aqe, &layout, parameters.map, packet)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   memcpy(parameters.map + TU_AQE_HEADER_DWORDS, stage.words, stage.dwords * 4);
+
+   struct tu_cs *cs = &cmd->draw_cs;
+   cmd->state.rp.has_mesh = true;
+   tu6_emit_vs_params(cmd, 0, 0, 0);
+   tu6_draw_common<CHIP>(cmd, cs, true, 0);
+   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+   tu_mesh_emit_program<CHIP>(cmd, cs, ms);
+
+   struct tu_cs input_cs;
+   struct tu_draw_state input = tu_cs_draw_state(&cmd->sub_cs, &input_cs, 7);
+   tu_cs_emit_regs(&input_cs, A6XX_VFD_VERTEX_BUFFER_STRIDE(0, 16));
+   tu_cs_emit_pkt4(&input_cs, REG_A6XX_VFD_FETCH_INSTR_INSTR(0), 2);
+   tu_cs_emit(&input_cs, 0x48300000);
+   tu_cs_emit(&input_cs, 0);
+   tu_cs_emit_regs(&input_cs, VPC_UNKNOWN_CNTL(CHIP, 1));
+   tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 9);
+   tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + TU_DYNAMIC_STATE_VERTEX_INPUT, input);
+   tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + TU_DYNAMIC_STATE_VB_STRIDE, {});
+   tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VB, {});
+   tu_cs_reserve(cs, TU_AQE_PACKET_DWORDS);
+   tu_cs_emit_array(cs, packet, TU_AQE_PACKET_DWORDS);
+   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+   tu_cs_emit_regs(cs, VPC_UNKNOWN_CNTL(CHIP, 0));
+   cmd->state.compute_program_stale = true;
+   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS | TU_CMD_DIRTY_DRAW_STATE;
+   cmd->mesh_stats.draws++;
+   cmd->mesh_stats.chunks++;
+   if (TU_DEBUG(MESH))
+      fprintf(stderr, "mesh backend=native-aqe packet=0x7a groups=%u stage_dwords=%u\n",
+                draw->groups[0], stage.dwords);
+   trace_end_draw(&cmd->rp_trace, cs);
+}
+
+template <chip CHIP>
+static void
 tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
 {
    if (cmd->vk.record_result != VK_SUCCESS)
       return;
+
+   if (cmd->state.shaders[MESA_SHADER_MESH]->mesh.native_aqe) {
+      tu_mesh_draw_aqe<CHIP>(cmd, draw);
+      return;
+   }
+   if (debug_get_bool_option("TU_AQE_REQUIRE", false)) {
+      mesa_loge("AQE required but pipeline selected emulation; no draw submitted");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (TU_DEBUG(MESH))
+      fprintf(stderr, "mesh backend=emulation\n");
 
    uint32_t view_mask = cmd->state.vk_mv.view_mask;
    if (!view_mask) {

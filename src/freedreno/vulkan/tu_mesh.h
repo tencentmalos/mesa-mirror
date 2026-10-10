@@ -117,6 +117,7 @@ struct tu_mesh_state {
    uint16_t max_primitives;
    uint8_t verts_per_prim;
    uint8_t topology;
+   bool native_aqe;
 };
 
 void

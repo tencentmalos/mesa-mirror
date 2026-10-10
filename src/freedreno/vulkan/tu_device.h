@@ -180,6 +180,7 @@ struct tu_physical_device
    int emulate_second_queue;
 
    struct fd_dev_id dev_id;
+   bool aqe_enabled;
    struct fd_dev_info dev_info;
    const struct fd_dev_info *info;
 
@@ -386,6 +387,7 @@ struct tu_device
     * protected by the device mutex.
     */
    struct tu_bo *mesh_ring;
+   struct tu_bo *mesh_aqe_arena;
    struct tu_shader *mesh_setup;
 
    struct ir3_shader_variant *global_shader_variants[GLOBAL_SH_COUNT];

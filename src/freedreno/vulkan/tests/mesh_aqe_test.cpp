@@ -8,6 +8,7 @@
 #include "freedreno_pm4.h"
 #include "ir3/ir3_nir.h"
 #include "ir3/ir3_shader.h"
+#include "nir/nir_builder.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%d: %s\n", __LINE__, #x); abort(); } } while (0)
 
@@ -201,6 +202,77 @@ test_stage(const ir3_shader_variant *v, const char *directory)
 }
 
 static void
+test_lowering(ir3_compiler *compiler)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, ir3_get_compiler_options(compiler), "application_mesh");
+   b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_array_type(glsl_vec4_type(), 3, 0), "positions");
+   pos->data.location = VARYING_SLOT_POS;
+   nir_variable *idx = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_array_type(glsl_vector_type(GLSL_TYPE_UINT, 3), 1, 0), "indices");
+   idx->data.location = VARYING_SLOT_PRIMITIVE_INDICES;
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3), nir_imm_int(&b, 1),
+                                      nir_imm_int(&b, 1));
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_push_if(&b, nir_ult_imm(&b, lane, 3));
+   nir_store_array_var(&b, pos, lane,
+      nir_vec4(&b, nir_u2f32(&b, lane), nir_imm_float(&b, 0.5),
+               nir_imm_float(&b, 0), nir_imm_float(&b, 1)), 0xf);
+   nir_pop_if(&b, NULL);
+   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+   nir_store_array_var_imm(&b, idx, 0, nir_imm_ivec3(&b, 2, 0, 1), 7);
+   nir_pop_if(&b, NULL);
+
+   b.shader->info.mesh.max_vertices_out = 4;
+   CHECK(!tu_aqe_lower_mesh(b.shader));
+   CHECK(b.shader->info.stage == MESA_SHADER_MESH);
+   b.shader->info.mesh.max_vertices_out = 3;
+   pos->data.location = VARYING_SLOT_VAR0;
+   CHECK(!tu_aqe_lower_mesh(b.shader));
+   pos->data.location = VARYING_SLOT_POS;
+   CHECK(tu_aqe_lower_mesh(b.shader));
+   nir_validate_shader(b.shader, "lowered application AQE mesh");
+   CHECK(b.shader->info.stage == MESA_SHADER_COMPUTE);
+   unsigned stores = 0, index_stores = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic) continue;
+            auto *intr = nir_instr_as_intrinsic(instr);
+            CHECK(intr->intrinsic != nir_intrinsic_set_vertex_and_primitive_count);
+            CHECK(intr->intrinsic != nir_intrinsic_store_deref);
+            if (intr->intrinsic == nir_intrinsic_store_global) {
+               stores++;
+               index_stores += intr->src[0].ssa->bit_size == 16;
+            }
+         }
+      }
+   }
+   CHECK(stores == 4 && index_stores == 1);
+   ir3_shader_options options = {};
+   options.const_allocs.max_const_offset_vec4 = TU_AQE_CONSTANT_VEC4S;
+   ir3_finalize_nir(compiler, &options.nir_options, b.shader);
+   auto *shader = ir3_shader_from_nir(compiler, b.shader, &options);
+   ir3_shader_key key = {};
+   auto *v = ir3_shader_create_variant(shader, &key, true);
+   CHECK(v && !v->need_driver_params);
+   tu_aqe_stage stage;
+   tu_aqe_bo binary = { 0x123400000000ull, v->info.size };
+   CHECK(tu_aqe_build_triangle_stage(v, &binary, &stage));
+   ralloc_free(v);
+   ir3_shader_destroy(shader);
+   nir_shader *vs = tu_aqe_build_vs(ir3_get_compiler_options(compiler));
+   nir_validate_shader(vs, "AQE hardware vertex fetch");
+   ralloc_free(vs);
+}
+
+static void
 test_shader(const char *directory)
 {
    glsl_type_singleton_init_or_ref();
@@ -209,6 +281,7 @@ test_shader(const char *directory)
    ir3_compiler *compiler = ir3_compiler_create(
       NULL, &id, fd_dev_info_raw(&id), &compiler_options);
    CHECK(compiler);
+   test_lowering(compiler);
    nir_shader *nir = tu_aqe_build_triangle_cs(ir3_get_compiler_options(compiler));
    nir_validate_shader(nir, "AQE triangle");
    ir3_shader_options options = {};

@@ -1971,6 +1971,12 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
       ((info.chip_id >> 16) & 0xff) * 10 +
       ((info.chip_id >>  8) & 0xff);
    device->dev_id.chip_id = info.chip_id;
+   {
+      uint32_t enabled = 0;
+      device->aqe_enabled =
+         !get_kgsl_prop(fd, KGSL_PROP_IS_AQE_ENABLED, &enabled, sizeof(enabled)) &&
+         enabled != 0;
+   }
    device->gmem_size = debug_get_num_option("TU_GMEM", info.gmem_sizebytes);
    device->gmem_base = gmem_iova;
 

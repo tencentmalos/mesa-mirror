@@ -1798,6 +1798,10 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
          builder->device->instance->drirc.misc.override_graphics_shader_version;
       keys[stage].mesh_queries =
          builder->device->vk.enabled_features.meshShaderQueries;
+      keys[stage].mesh_aqe =
+         debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE", false) &&
+         builder->device->physical_device->aqe_enabled &&
+         builder->device->physical_device->dev_id.chip_id == 0x44050000;
 
       const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroup_info = NULL;
       if (stage_infos[stage])
