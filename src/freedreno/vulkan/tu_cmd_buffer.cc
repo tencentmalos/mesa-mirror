@@ -3217,8 +3217,7 @@ tu7_emit_concurrent_binning_start(struct tu_cmd_buffer *cmd,
                                   bool disable_cb)
 {
    if (tu7_cb_disable_reason(
-          disable_cb || (cmd->device->physical_device->aqe_enabled &&
-                         debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE", false)),
+          disable_cb || (cmd->state.rp.has_mesh && cmd->state.rp.has_native_aqe),
           cmd, "disable_cb") ||
        /* LRZ can only be cleared via fast clear in BV. Disable CB if we can't
         * use it.
@@ -4315,6 +4314,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    struct tu_cmd_buffer *cmd_buffer =
       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
 
+   tu_aqe_resources_finish(cmd_buffer->device, &cmd_buffer->mesh_aqe);
+
    tu_cs_finish(&cmd_buffer->cs);
    tu_cs_finish(&cmd_buffer->draw_cs);
    tu_cs_finish(&cmd_buffer->tile_store_cs);
@@ -4391,6 +4392,8 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
 {
    struct tu_cmd_buffer *cmd_buffer =
       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
+
+   tu_aqe_resources_finish(cmd_buffer->device, &cmd_buffer->mesh_aqe);
 
    VkResult status_check_result = VK_SUCCESS;
    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
@@ -6378,6 +6381,7 @@ tu_render_pass_state_merge(struct tu_cmd_buffer *cmd, const struct tu_render_pas
    dst->xfb_used |= src->xfb_used;
    dst->has_tess |= src->has_tess;
    dst->has_mesh |= src->has_mesh;
+   dst->has_native_aqe |= src->has_native_aqe;
    dst->has_prim_generated_query_in_rp |= src->has_prim_generated_query_in_rp;
    dst->has_vtx_stats_query_in_rp |= src->has_vtx_stats_query_in_rp;
    dst->has_zpass_done_sample_count_write_in_rp |= src->has_zpass_done_sample_count_write_in_rp;
@@ -6545,6 +6549,8 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < commandBufferCount; i++) {
       VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
+
+      tu_aqe_resources_add_secondary(&cmd->mesh_aqe, &secondary->mesh_aqe);
 
 #ifdef HAVE_PERFETTO
       /* Propagate viewport/scissor state so that we can emit the correct
@@ -10890,14 +10896,13 @@ static void
 tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
 {
    const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
-   struct tu_bo *arena = cmd->device->mesh_aqe_arena;
    struct tu_aqe_stage stage;
    struct tu_aqe_layout layout;
    struct tu_aqe_bo binary = { ms->binary_iova, ms->variant->info.size };
    const uint32_t draws = draw->indirect ? draw->draw_count : 1;
    const uint64_t address_limit = 1ull << 49;
    const uint64_t indirect_bytes = uint64_t(draws ? draws - 1 : 0) * draw->stride + 12;
-   if (CHIP != A8XX || !arena || cmd->state.vk_mv.view_mask ||
+   if (CHIP != A8XX || cmd->state.vk_mv.view_mask ||
        !draws || draws >= (1u << 31) ||
        (draw->indirect && (draw->indirect % 4 || draw->indirect >= address_limit ||
           indirect_bytes > address_limit - draw->indirect ||
@@ -10910,13 +10915,21 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   const uint64_t estimated = uint64_t(draws) * 512 + 65536;
+   const uint64_t estimated = uint64_t(draws) * 1024 + 65536;
    if (!tu_mesh_check_budget(cmd, estimated))
       return;
+
+   VkResult arena_result = tu_aqe_resources_require(cmd->device, &cmd->mesh_aqe, layout.size);
+   if (arena_result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, arena_result);
+      return;
+   }
+   struct tu_bo *arena = cmd->mesh_aqe.arena;
 
    struct tu_cs *cs = &cmd->draw_cs;
    const uint64_t before = tu_mesh_cs_bytes(cs) + tu_mesh_cs_bytes(&cmd->sub_cs);
    cmd->state.rp.has_mesh = true;
+   cmd->state.rp.has_native_aqe = true;
    tu6_emit_vs_params(cmd, 0, 0, 0);
    tu6_draw_common<CHIP>(cmd, cs, true, 0);
    tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
@@ -10954,8 +10967,9 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    }
    for (uint32_t i = 0; i < draws; i++) {
       struct tu_cs_memory parameters;
-      unsigned dwords = TU_AQE_HEADER_DWORDS + stage.dwords;
-      VkResult result = tu_cs_alloc(&cmd->sub_cs, dwords, 1, &parameters);
+      unsigned metadata_offset = ALIGN_POT(TU_AQE_HEADER_DWORDS + stage.dwords, 4);
+      unsigned dwords = metadata_offset + sizeof(struct tu_aqe_draw_metadata) / 4;
+      VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dwords, 4), 4, &parameters);
       if (result != VK_SUCCESS) {
          vk_command_buffer_set_error(&cmd->vk, result);
          return;
@@ -10968,6 +10982,7 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
          .groups = { draw->groups[0], draw->groups[1], draw->groups[2] },
          .indirect = draw->indirect ?
             tu_aqe_bo{draw->indirect + uint64_t(i) * draw->stride, 12} : tu_aqe_bo{},
+         .metadata = {parameters.iova + metadata_offset * 4, sizeof(struct tu_aqe_draw_metadata)},
       };
       uint32_t packet[TU_AQE_PACKET_DWORDS];
       if (!tu_aqe_build_triangle(&aqe, &layout, parameters.map, packet)) {
@@ -10975,10 +10990,10 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
          return;
       }
       memcpy(parameters.map + TU_AQE_HEADER_DWORDS, stage.words, stage.dwords * 4);
-      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
-      tu_cs_emit_qw(cs, draw_data);
-      tu_cs_emit(cs, i);
-      tu_mesh_emit_cp_barrier<CHIP>(cmd, cs);
+      struct tu_aqe_draw_metadata metadata = {.draw_id = i};
+      static_assert(sizeof(metadata.push_constants) == sizeof(cmd->push_constants));
+      memcpy(metadata.push_constants, cmd->push_constants, sizeof(metadata.push_constants));
+      memcpy(parameters.map + metadata_offset, &metadata, sizeof(metadata));
       unsigned packet_dwords = draw->indirect ? TU_AQE_INDIRECT_PACKET_DWORDS :
                                                TU_AQE_PACKET_DWORDS;
       if (draw->count) {

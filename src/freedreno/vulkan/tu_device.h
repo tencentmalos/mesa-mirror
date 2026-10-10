@@ -178,6 +178,7 @@ struct tu_physical_device
 
    /** Queue family index with an emulated second queue, or -1 if none */
    int emulate_second_queue;
+   bool native_aqe_queues;
 
    struct fd_dev_id dev_id;
    bool aqe_enabled;
@@ -319,6 +320,7 @@ struct tu_device
 
    struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];
    int queue_count[TU_MAX_QUEUE_FAMILIES];
+   struct tu_aqe_submission *last_experimental_queue_submission;
 
    struct tu_physical_device *physical_device;
    uint32_t device_idx;
@@ -387,7 +389,6 @@ struct tu_device
     * protected by the device mutex.
     */
    struct tu_bo *mesh_ring;
-   struct tu_bo *mesh_aqe_arena;
    struct tu_shader *mesh_setup;
 
    struct ir3_shader_variant *global_shader_variants[GLOBAL_SH_COUNT];

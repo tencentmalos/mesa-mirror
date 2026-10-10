@@ -36,6 +36,13 @@ struct tu_aqe_bo {
    uint64_t size;
 };
 
+struct tu_aqe_draw_metadata {
+   uint32_t draw_id;
+   uint32_t view_index;
+   uint32_t reserved[2];
+   uint32_t push_constants[64];
+};
+
 struct tu_aqe_triangle_draw {
    struct tu_aqe_bo arena;
    struct tu_aqe_bo parameters;
@@ -43,6 +50,7 @@ struct tu_aqe_triangle_draw {
    uint32_t state_dwords;
    uint32_t groups[3];
    struct tu_aqe_bo indirect;
+   struct tu_aqe_bo metadata;
 };
 
 bool tu_aqe_triangle_layout(uint32_t mesh_capacity, uint32_t task_capacity,

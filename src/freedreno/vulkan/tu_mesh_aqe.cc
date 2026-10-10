@@ -79,6 +79,15 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
        draw->parameters.iova < draw->arena.iova + draw->arena.size)
       return false;
 
+   if (draw->metadata.iova || draw->metadata.size) {
+      if (!valid_bo(&draw->metadata, 16) ||
+          draw->metadata.size < sizeof(struct tu_aqe_draw_metadata) ||
+          draw->metadata.size > UINT32_MAX ||
+          (draw->metadata.iova < draw->arena.iova + draw->arena.size &&
+           draw->arena.iova < draw->metadata.iova + draw->metadata.size))
+         return false;
+   }
+
    if (draw->indirect.iova) {
       if (!valid_bo(&draw->indirect, 4) || draw->indirect.size < 12)
          return false;
@@ -121,6 +130,10 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
       const struct tu_aqe_span *span = &layout->regions[order[i]];
       write_address(p + 11 + i * 3, draw->arena.iova + span->offset);
       p[13 + i * 3] = span->size;
+   }
+   if (draw->metadata.iova) {
+      write_address(p + 26, draw->metadata.iova);
+      p[28] = draw->metadata.size;
    }
    if (draw->indirect.iova) {
       p[0] = 0x707a801e;

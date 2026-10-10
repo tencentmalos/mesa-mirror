@@ -52,6 +52,7 @@ libtu_files = files(
   'tu_lrz.cc',
   'tu_mesh.cc',
   'tu_mesh_aqe.cc',
+  'tu_mesh_aqe_resources.cc',
   'tu_mesh_aqe_nir.cc',
   'tu_mesh_aqe_state.cc',
   'tu_nir_lower_demote_samples.cc',
@@ -300,6 +301,15 @@ _dev_icd = custom_target(
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 
 if with_tests
+  test('tu_mesh_aqe_resources', executable(
+    'tu_mesh_aqe_resources_test',
+    ['tests/mesh_aqe_resources_test.cpp', 'tu_mesh_aqe_resources.cc', 'tu_mesh_aqe.cc',
+     tu_entrypoints[0], tu_drirc[1], freedreno_xml_header_files],
+    include_directories : libtu_includes,
+    dependencies : [idep_nir, idep_mesautil, idep_vulkan_util,
+                    idep_vulkan_runtime, idep_vulkan_wsi],
+    cpp_args : [tu_cpp_args, tu_flags],
+  ), suite : ['freedreno'])
   test('tu_mesh_aqe', executable(
     'tu_mesh_aqe_test',
     ['tests/mesh_aqe_test.cpp', 'tu_mesh_aqe.cc', 'tu_mesh_aqe_nir.cc',

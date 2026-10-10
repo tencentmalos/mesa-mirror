@@ -25,6 +25,7 @@
 #include "tu_mesh_aqe.h"
 #include "tu_mesh_aqe_nir.h"
 #include "tu_pipeline.h"
+#include "tu_queue_scope.h"
 #include "tu_rmv.h"
 #include "tu_sampler.h"
 #include "tu_subsampled_image.h"
@@ -3553,7 +3554,8 @@ tu_lower_nir(struct tu_device *dev,
     * dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.image.guard_local.buffer.vert
     */
 
-   NIR_PASS(_, nir, nir_opt_acquire_release_barriers, SCOPE_QUEUE_FAMILY);
+   NIR_PASS(_, nir, nir_opt_acquire_release_barriers,
+            tu_acquire_release_max_scope(dev->physical_device->native_aqe_queues));
 
    /* This needs to happen before multiview lowering which rewrites store
     * instructions of the position variable, so that we can just rewrite one
@@ -4361,19 +4363,6 @@ tu_init_mesh_shading(struct tu_device *dev)
 
    VkResult result = VK_SUCCESS;
    mtx_lock(&dev->mutex);
-   if (!dev->mesh_aqe_arena &&
-       debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE", false) &&
-       dev->physical_device->aqe_enabled &&
-       dev->physical_device->dev_id.chip_id == 0x44050000) {
-      struct tu_aqe_layout layout;
-      tu_aqe_triangle_layout(256, 256, &layout);
-      result = tu_bo_init_new(dev, NULL, &dev->mesh_aqe_arena, layout.size,
-                              TU_BO_ALLOC_INTERNAL_RESOURCE, "mesh AQE arena");
-      if (result != VK_SUCCESS) {
-         mtx_unlock(&dev->mutex);
-         return result;
-      }
-   }
    if (!dev->mesh_ring) {
       result = tu_bo_init_new(dev, NULL, &dev->mesh_ring, TU_MESH_RING_SIZE,
                               TU_BO_ALLOC_INTERNAL_RESOURCE, "mesh ring");

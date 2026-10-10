@@ -17,6 +17,7 @@
 #include "tu_device.h"
 #include "tu_image.h"
 #include "tu_lrz.h"
+#include "tu_mesh_aqe_resources.h"
 #include "tu_pass.h"
 #include "tu_pipeline.h"
 #include "tu_tile_config.h"
@@ -320,6 +321,7 @@ struct tu_render_pass_state
    bool xfb_used;
    bool has_tess;
    bool has_mesh;
+   bool has_native_aqe;
    bool has_prim_generated_query_in_rp;
    bool has_vtx_stats_query_in_rp;
    bool has_zpass_done_sample_count_write_in_rp;
@@ -713,6 +715,8 @@ struct tu_cmd_buffer
    struct vk_command_buffer vk;
 
    struct tu_device *device;
+
+   struct tu_aqe_resources mesh_aqe;
 
    struct {
       uint64_t draws;

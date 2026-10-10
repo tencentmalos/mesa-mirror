@@ -131,6 +131,8 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    _mesa_blake3_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
    _mesa_blake3_update(&ctx, &device->compiler_options,
                        sizeof(device->compiler_options));
+   _mesa_blake3_update(&ctx, &device->native_aqe_queues,
+                       sizeof(device->native_aqe_queues));
    _mesa_blake3_final(&ctx, blake3);
 
    memcpy(uuid, blake3, VK_UUID_SIZE);
@@ -207,7 +209,7 @@ static bool
 tu_has_mesh_shader(const struct tu_physical_device *device)
 {
    return debug_get_bool_option("TU_EXPERIMENTAL_MESH", false) &&
-          !device->instance->drirc.misc.emulate_second_queue &&
+          (!device->instance->drirc.misc.emulate_second_queue || device->native_aqe_queues) &&
           device->info->chip == 8 &&
           device->info->cs_shared_mem_size >= 32 * 1024;
 }
@@ -1851,6 +1853,12 @@ tu_physical_device_init(struct tu_physical_device *device,
 
    tu_physical_device_compiler_options_init(device, instance);
 
+   device->native_aqe_queues = device->aqe_enabled &&
+      device->dev_id.chip_id == UINT64_C(0x44050000) &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH", false) &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE", false) &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE_QUEUES", false);
+
    if (tu_device_get_cache_uuid(device, device->cache_uuid)) {
       result = vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                                  "cannot generate UUID");
@@ -1963,7 +1971,7 @@ tu_physical_device_init(struct tu_physical_device *device,
    }
 
    device->emulate_second_queue = -1;
-   if (instance->drirc.misc.emulate_second_queue) {
+   if (instance->drirc.misc.emulate_second_queue && !device->native_aqe_queues) {
       for (unsigned i = 0; i < device->num_queue_families; i++) {
          if (device->queue_families[i].properties->queueFlags &
              VK_QUEUE_GRAPHICS_BIT) {
@@ -2183,7 +2191,8 @@ tu_GetPhysicalDeviceQueueFamilyProperties2(
       vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
          p->queueFamilyProperties = *family->properties;
 
-         if (pdevice->emulate_second_queue == (int) i)
+         if (pdevice->emulate_second_queue == (int) i ||
+             (pdevice->native_aqe_queues && family->type == TU_QUEUE_GFX))
             p->queueFamilyProperties.queueCount = 2;
 
          vk_foreach_struct(sType, ext, p->pNext) {
@@ -3466,10 +3475,10 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       vk_pipeline_cache_object_unref(&device->vk, &device->mesh_setup->base);
    if (device->mesh_ring)
       tu_bo_finish(device, device->mesh_ring);
-   if (device->mesh_aqe_arena)
-      tu_bo_finish(device, device->mesh_aqe_arena);
 
    tu_destroy_dynamic_rendering(device);
+
+   tu_aqe_submission_unref(device, device->last_experimental_queue_submission);
 
    vk_meta_device_finish(&device->vk, &device->meta);
 

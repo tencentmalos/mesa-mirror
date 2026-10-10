@@ -12,6 +12,7 @@
 #include <inttypes.h>
 
 #include "vk_util.h"
+#include "vk_sync.h"
 
 #include "tu_buffer.h"
 #include "tu_cmd_buffer.h"
@@ -413,6 +414,90 @@ out:
 }
 
 static VkResult
+submit_with_aqe_dependencies(struct tu_queue *queue, void *submit,
+                              struct vk_queue_submit *vk_submit,
+                              struct tu_cmd_buffer **cmds, uint32_t count,
+                              struct tu_u_trace_submission_data *trace)
+{
+   struct tu_device *dev = queue->device;
+   struct util_dynarray owners = UTIL_DYNARRAY_INIT;
+   for (uint32_t i = 0; i < count; i++)
+      tu_aqe_resources_collect(&cmds[i]->mesh_aqe, &owners);
+   const bool serialize_queues = dev->physical_device->native_aqe_queues;
+   if (!owners.size && !serialize_queues)
+      return tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
+                             vk_submit->signals, vk_submit->signal_count, trace);
+
+   struct tu_aqe_submission *completion = (struct tu_aqe_submission *)calloc(1, sizeof(*completion));
+   if (!completion) {
+      util_dynarray_fini(&owners);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   completion->refs = 1;
+   completion->queue = queue;
+   VkResult result = vk_sync_create(&dev->vk, dev->physical_device->sync_types[0],
+                                    (enum vk_sync_flags)0, 0, &completion->sync);
+   if (result != VK_SUCCESS) {
+      free(completion);
+      util_dynarray_fini(&owners);
+      return result;
+   }
+
+   struct util_dynarray waits = UTIL_DYNARRAY_INIT;
+   struct util_dynarray signals = UTIL_DYNARRAY_INIT;
+   util_dynarray_append_array(&waits, struct vk_sync_wait, vk_submit->waits, vk_submit->wait_count);
+   util_dynarray_append_array(&signals, struct vk_sync_signal, vk_submit->signals, vk_submit->signal_count);
+   auto add_dependency = [&](struct tu_aqe_submission *last) {
+      if (!last || last->queue == queue)
+         return;
+      bool present = false;
+      util_dynarray_foreach (&waits, struct vk_sync_wait, wait)
+         present |= wait->sync == last->sync;
+      if (!present) {
+         struct vk_sync_wait wait = {
+            .sync = last->sync,
+            .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         };
+         util_dynarray_append(&waits, wait);
+         if (TU_DEBUG(MESH))
+            fprintf(stderr, "AQE queue dependency from=%u to=%u\n",
+                    last->queue->msm_queue_id, queue->msm_queue_id);
+      }
+   };
+   util_dynarray_foreach (&owners, struct tu_aqe_resources *, owner)
+      add_dependency((*owner)->last_submission);
+   if (serialize_queues)
+      add_dependency(dev->last_experimental_queue_submission);
+   struct vk_sync_signal signal = {
+      .sync = completion->sync,
+      .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+   };
+   util_dynarray_append(&signals, signal);
+   result = tu_queue_submit(queue, submit,
+                            (struct vk_sync_wait *)waits.data,
+                            util_dynarray_num_elements(&waits, struct vk_sync_wait),
+                            (struct vk_sync_signal *)signals.data,
+                            util_dynarray_num_elements(&signals, struct vk_sync_signal), trace);
+   if (result == VK_SUCCESS) {
+      if (serialize_queues) {
+         tu_aqe_submission_unref(dev, dev->last_experimental_queue_submission);
+         p_atomic_inc(&completion->refs);
+         dev->last_experimental_queue_submission = completion;
+      }
+      util_dynarray_foreach (&owners, struct tu_aqe_resources *, owner) {
+         tu_aqe_submission_unref(dev, (*owner)->last_submission);
+         p_atomic_inc(&completion->refs);
+         (*owner)->last_submission = completion;
+      }
+   }
+   tu_aqe_submission_unref(dev, completion);
+   util_dynarray_fini(&waits);
+   util_dynarray_fini(&signals);
+   util_dynarray_fini(&owners);
+   return result;
+}
+
+static VkResult
 queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 {
    MESA_TRACE_FUNC();
@@ -560,10 +645,8 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    }
 #endif
 
-   result =
-      tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
-                      vk_submit->signals, vk_submit->signal_count,
-                      u_trace_submission_data);
+   result = submit_with_aqe_dependencies(queue, submit, vk_submit, cmd_buffers,
+                                         cmdbuf_count, u_trace_submission_data);
 
    if (result != VK_SUCCESS) {
       pthread_mutex_unlock(&device->submit_mutex);
@@ -659,6 +742,9 @@ tu_queue_init(struct tu_device *device,
       return vk_startup_errorf(device->instance, VK_ERROR_INITIALIZATION_FAILED,
                                "submitqueue create failed");
    }
+
+   if (TU_DEBUG(MESH) && device->physical_device->native_aqe_queues)
+      fprintf(stderr, "AQE real queue index=%d context=%u\n", idx, queue->msm_queue_id);
 
    return VK_SUCCESS;
 }

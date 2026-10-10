@@ -1,10 +1,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 #include "tu_mesh_aqe.h"
 #include "tu_mesh_aqe_nir.h"
 #include "tu_mesh_aqe_state.h"
+#include "tu_queue_scope.h"
 #include "freedreno_pm4.h"
 #include "ir3/ir3_nir.h"
 #include "ir3/ir3_shader.h"
@@ -127,6 +129,18 @@ test_packet(const char *directory)
    d.indirect = {(1ull << 49) - 4, 12}; reject();
    d.indirect = {0, 12}; reject();
    d.indirect = {0x345600000000ull, 11}; reject();
+   d.metadata = {0, sizeof(tu_aqe_draw_metadata)}; reject();
+   d.metadata = {0x345600000001ull, sizeof(tu_aqe_draw_metadata)}; reject();
+   d.metadata = {0x345600000000ull, sizeof(tu_aqe_draw_metadata) - 1}; reject();
+   d.metadata = {good.arena.iova, sizeof(tu_aqe_draw_metadata)}; reject();
+   d.metadata = {(1ull << 49) - 16, sizeof(tu_aqe_draw_metadata)}; reject();
+   d.metadata = {0x345600000000ull, sizeof(tu_aqe_draw_metadata)};
+   CHECK(tu_aqe_build_triangle(&d, &layout, h, p));
+   CHECK(address(p + 26) == d.metadata.iova && p[28] == sizeof(tu_aqe_draw_metadata));
+   d.indirect = {0x456700000000ull, 12};
+   CHECK(tu_aqe_build_triangle(&d, &layout, h, p));
+   CHECK(address(p + 25) == d.metadata.iova && p[27] == sizeof(tu_aqe_draw_metadata));
+   d = good;
    const uint32_t dimensions[][3] = {
       {255, 1, 1}, {256, 1, 1}, {257, 1, 1}, {17, 17, 3},
       {65535, 3, 1}, {16384, 256, 1},
@@ -350,12 +364,58 @@ test_shader(const char *directory)
    glsl_type_singleton_decref();
 }
 
+static void
+test_queue_barrier_scope()
+{
+   glsl_type_singleton_init_or_ref();
+   const nir_shader_compiler_options options = {};
+   for (bool multiple_queues : {true, false}) {
+      for (mesa_scope scope : {SCOPE_DEVICE, SCOPE_QUEUE_FAMILY, SCOPE_WORKGROUP}) {
+         nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                       &options, "queue_scope");
+         nir_variable *var = nir_variable_create(b.shader, nir_var_mem_global,
+                                                glsl_uint_type(), "counter");
+         nir_deref_instr *deref = nir_build_deref_var(&b, var);
+         nir_def *one = nir_imm_int(&b, 1);
+         for (unsigned i = 0; i < 2; i++) {
+            nir_barrier(&b, SCOPE_NONE, scope, NIR_MEMORY_RELEASE, nir_var_mem_global);
+            nir_intrinsic_instr *atomic = nir_intrinsic_instr_create(
+               b.shader, nir_intrinsic_deref_atomic);
+            atomic->num_components = 1;
+            atomic->src[0] = nir_src_for_ssa(&deref->def);
+            atomic->src[1] = nir_src_for_ssa(one);
+            nir_intrinsic_set_atomic_op(atomic, nir_atomic_op_iadd);
+            nir_def_init(&atomic->instr, &atomic->def, 1, 32);
+            nir_builder_instr_insert(&b, &atomic->instr);
+            nir_barrier(&b, SCOPE_NONE, scope, NIR_MEMORY_ACQUIRE, nir_var_mem_global);
+         }
+         const bool optimized = nir_opt_acquire_release_barriers(
+            b.shader, tu_acquire_release_max_scope(multiple_queues));
+         const bool expected = scope == SCOPE_WORKGROUP ||
+                               (!multiple_queues && scope == SCOPE_QUEUE_FAMILY);
+         CHECK(optimized == expected);
+         unsigned barriers = 0;
+         nir_foreach_block(block, b.impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_barrier)
+                  barriers++;
+            }
+         }
+         CHECK(barriers == (expected ? 2u : 4u));
+         ralloc_free(b.shader);
+      }
+   }
+   glsl_type_singleton_decref();
+}
+
 int
 main(int argc, char **argv)
 {
    const char *directory = argc == 2 ? argv[1] : NULL;
    test_layout();
    test_packet(directory);
+   test_queue_barrier_scope();
    test_shader(directory);
    puts("AQE layout, relocation, rejection and A830 shader compilation passed");
 }
