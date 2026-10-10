@@ -846,7 +846,9 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->meshShader = tu_has_mesh_shader(pdevice);
    features->multiviewMeshShader = tu_has_mesh_shader(pdevice) &&
       debug_get_bool_option("TU_EXPERIMENTAL_MESH_MULTIVIEW", false);
-   features->primitiveFragmentShadingRateMeshShader = false;
+   features->primitiveFragmentShadingRateMeshShader = tu_has_mesh_shader(pdevice) &&
+      pdevice->info->props.has_primitive_shading_rate &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH_FSR", false);
    features->meshShaderQueries = tu_has_mesh_shader(pdevice) &&
       debug_get_bool_option("TU_EXPERIMENTAL_MESH_QUERIES", false);
 
@@ -1483,14 +1485,18 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->minPlacedMemoryMapAlignment = os_page_size;
 
    /* VK_EXT_mesh_shader */
+   const bool extended_mesh_limits = tu_has_mesh_shader(pdevice) &&
+      debug_get_bool_option("TU_EXPERIMENTAL_MESH_LIMITS", false);
+   const uint32_t mesh_workgroup_size = extended_mesh_limits ?
+      MIN2(1024, props->maxComputeWorkGroupInvocations) : 128;
    props->maxTaskWorkGroupTotalCount = 1u << 22;
    props->maxTaskWorkGroupCount[0] = 65535;
    props->maxTaskWorkGroupCount[1] = 65535;
    props->maxTaskWorkGroupCount[2] = 65535;
-   props->maxTaskWorkGroupInvocations = 128;
-   props->maxTaskWorkGroupSize[0] = 128;
-   props->maxTaskWorkGroupSize[1] = 128;
-   props->maxTaskWorkGroupSize[2] = 128;
+   props->maxTaskWorkGroupInvocations = mesh_workgroup_size;
+   props->maxTaskWorkGroupSize[0] = mesh_workgroup_size;
+   props->maxTaskWorkGroupSize[1] = mesh_workgroup_size;
+   props->maxTaskWorkGroupSize[2] = mesh_workgroup_size;
    props->maxTaskPayloadSize = 16384;
    props->maxTaskSharedMemorySize = 32768;
    props->maxTaskPayloadAndSharedMemorySize = 32768;
@@ -1498,12 +1504,15 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxMeshWorkGroupCount[0] = 65535;
    props->maxMeshWorkGroupCount[1] = 65535;
    props->maxMeshWorkGroupCount[2] = 65535;
-   props->maxMeshWorkGroupInvocations = 128;
-   props->maxMeshWorkGroupSize[0] = 128;
-   props->maxMeshWorkGroupSize[1] = 128;
-   props->maxMeshWorkGroupSize[2] = 128;
-   props->maxMeshSharedMemorySize = 28672;
-   props->maxMeshPayloadAndSharedMemorySize = 16384 + 28672;
+   props->maxMeshWorkGroupInvocations = mesh_workgroup_size;
+   props->maxMeshWorkGroupSize[0] = mesh_workgroup_size;
+   props->maxMeshWorkGroupSize[1] = mesh_workgroup_size;
+   props->maxMeshWorkGroupSize[2] = mesh_workgroup_size;
+   props->maxMeshSharedMemorySize = extended_mesh_limits ?
+      props->maxComputeSharedMemorySize - TU_MESH_SHARED_COUNTS * sizeof(uint32_t) :
+      28672;
+   props->maxMeshPayloadAndSharedMemorySize =
+      props->maxTaskPayloadSize + props->maxMeshSharedMemorySize;
    props->maxMeshOutputMemorySize = 32768;
    props->maxMeshPayloadAndOutputMemorySize = 16384 + 32768;
    props->maxMeshOutputComponents = 128;

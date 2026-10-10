@@ -706,7 +706,7 @@ tu_mesh_lower_ms(nir_shader *ms, const struct tu_mesh_io *io,
 
    struct lower_sysvals_state sysvals = {
       .counts = nir_variable_create(ms, nir_var_mem_shared,
-                                    glsl_array_type(glsl_uint_type(), 2, 4),
+                                    glsl_array_type(glsl_uint_type(), TU_MESH_SHARED_COUNTS, 4),
                                     "tu_mesh_counts"),
    };
    load_table_sysvals(b, ring, TU_MESH_MS_TABLE_OFFSET, &sysvals.table);

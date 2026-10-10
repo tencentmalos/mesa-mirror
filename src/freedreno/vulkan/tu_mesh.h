@@ -79,6 +79,7 @@ static_assert(TU_MESH_VIEW_INDEX_OFFSET + sizeof(uint32_t) <= TU_MESH_MS_TABLE_O
 #define TU_MESH_RECORD_SIZE (TU_MESH_RING_SIZE - TU_MESH_RECORD_OFFSET)
 
 #define TU_MESH_SETUP_WORKGROUP_SIZE 128
+#define TU_MESH_SHARED_COUNTS 2
 #define TU_MESH_DEAD_INDEX 0xffffffffu
 
 /* The fragment shader reads a mesh shader's PrimitiveId from this generic
