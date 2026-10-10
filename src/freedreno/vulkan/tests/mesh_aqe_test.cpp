@@ -290,6 +290,36 @@ test_lowering(ir3_compiler *compiler)
    nir_pop_if(&b, NULL);
 
    NIR_PASS(_, b.shader, nir_lower_system_values);
+   for (unsigned location : {VARYING_SLOT_PRIMITIVE_ID, VARYING_SLOT_LAYER,
+                             VARYING_SLOT_VIEWPORT, VARYING_SLOT_CLIP_DIST0,
+                             VARYING_SLOT_CULL_DIST0, VARYING_SLOT_VAR0}) {
+      nir_builder fb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+         ir3_get_compiler_options(compiler), "rejected_fragment");
+      nir_variable *in = nir_variable_create(fb.shader, nir_var_shader_in,
+                                               glsl_int_type(), "primitive_input");
+      in->data.location = location;
+      in->data.per_primitive = location == VARYING_SLOT_VAR0;
+      CHECK(!tu_aqe_fragment_supported(fb.shader));
+      ralloc_free(fb.shader);
+   }
+   for (unsigned location : {VARYING_SLOT_PRIMITIVE_ID, VARYING_SLOT_LAYER,
+                             VARYING_SLOT_VIEWPORT, VARYING_SLOT_CLIP_DIST0,
+                             VARYING_SLOT_CULL_DIST0, VARYING_SLOT_VAR0}) {
+      nir_shader *rejected = nir_shader_clone(NULL, b.shader);
+      nir_builder rb = nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(rejected)->body));
+      const bool distance = location == VARYING_SLOT_CLIP_DIST0 ||
+                            location == VARYING_SLOT_CULL_DIST0;
+      const glsl_type *type = distance ? glsl_float_type() : glsl_int_type();
+      nir_variable *out = nir_variable_create(rejected, nir_var_shader_out,
+         glsl_array_type(type, distance ? 3 : 1, 0), "rejected_output");
+      out->data.location = location;
+      out->data.per_primitive = !distance;
+      nir_store_array_var_imm(&rb, out, 0,
+                             distance ? nir_imm_float(&rb, 1.0f) : nir_imm_int(&rb, 1), 1);
+      CHECK(!tu_aqe_lower_mesh(rejected));
+      CHECK(rejected->info.stage == MESA_SHADER_MESH);
+      ralloc_free(rejected);
+   }
    b.shader->info.mesh.max_vertices_out = 129;
    CHECK(!tu_aqe_lower_mesh(b.shader));
    CHECK(b.shader->info.stage == MESA_SHADER_MESH);
@@ -314,9 +344,46 @@ test_lowering(ir3_compiler *compiler)
    nir_store_array_var_imm(&bad, ps, 0, nir_imm_float(&bad, 2.0f), 1);
    CHECK(!tu_aqe_lower_mesh(bad_point_size));
    ralloc_free(bad_point_size);
-   pos->data.location = VARYING_SLOT_VAR0;
+   pos->data.location = VARYING_SLOT_TEX0;
    CHECK(!tu_aqe_lower_mesh(b.shader));
    pos->data.location = VARYING_SLOT_POS;
+   nir_shader *varying = nir_shader_clone(NULL, b.shader);
+   nir_builder vb = nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(varying)->body));
+   nir_builder fb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      ir3_get_compiler_options(compiler), "varying_fragment");
+   const glsl_type *types[] = {glsl_vec4_type(), glsl_vec2_type(),
+                               glsl_int_type(), glsl_uint_type(), glsl_float_type()};
+   for (unsigned i = 0; i < ARRAY_SIZE(types); i++) {
+      nir_variable *out = nir_variable_create(varying, nir_var_shader_out,
+         glsl_array_type(types[i], 3, 0), "user_output");
+      out->data.location = VARYING_SLOT_VAR0 + i;
+      if (i == 2 || i == 3)
+         out->data.interpolation = INTERP_MODE_FLAT;
+      unsigned components = glsl_get_vector_elements(types[i]);
+      nir_store_array_var_imm(&vb, out, 0, nir_imm_zero(&vb, components, 32),
+                              BITFIELD_MASK(components));
+      if (i < 4) {
+         nir_variable *in = nir_variable_create(fb.shader, nir_var_shader_in,
+                                                   types[i], "user_input");
+         in->data.location = VARYING_SLOT_VAR0 + i;
+         in->data.interpolation = out->data.interpolation;
+      }
+   }
+   struct tu_aqe_vertex_io io;
+   nir_shader *bridge = NULL;
+   CHECK(tu_aqe_lower_mesh(varying, &io, &bridge, fb.shader));
+   CHECK(io.count == 5 && io.slots[VARYING_SLOT_VAR0 + 4] == UINT8_MAX);
+   nir_validate_shader(varying, "AQE varying writes");
+   nir_validate_shader(bridge, "AQE typed vertex bridge");
+   unsigned bridge_inputs = 0, flat_outputs = 0;
+   nir_foreach_variable_with_modes(var, bridge, nir_var_shader_in)
+      bridge_inputs++;
+   nir_foreach_variable_with_modes(var, bridge, nir_var_shader_out)
+      flat_outputs += var->data.interpolation == INTERP_MODE_FLAT;
+   CHECK(bridge_inputs == 5 && flat_outputs == 2);
+   ralloc_free(varying);
+   ralloc_free(bridge);
+   ralloc_free(fb.shader);
    CHECK(tu_aqe_lower_mesh(b.shader));
    nir_validate_shader(b.shader, "lowered application AQE mesh");
    CHECK(b.shader->info.stage == MESA_SHADER_COMPUTE);

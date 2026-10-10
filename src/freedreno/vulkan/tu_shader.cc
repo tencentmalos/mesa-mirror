@@ -24,6 +24,7 @@
 #include "tu_lrz.h"
 #include "tu_mesh_aqe.h"
 #include "tu_mesh_aqe_nir.h"
+#include "tu_mesh_aqe_state.h"
 #include "tu_pipeline.h"
 #include "tu_queue_scope.h"
 #include "tu_rmv.h"
@@ -3917,15 +3918,17 @@ tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
    const uint16_t max_primitives = ms->info.mesh.max_primitives_out;
    const uint8_t verts_per_prim = ms->info.mesh.primitive_type == MESA_PRIM_TRIANGLES ? 3 :
       ms->info.mesh.primitive_type == MESA_PRIM_LINES ? 2 : 1;
+   struct tu_aqe_vertex_io aqe_io;
+   nir_shader *aqe_vs = NULL;
    if (aqe && !queries && !multiview && !nir[MESA_SHADER_TASK] &&
-       tu_aqe_lower_mesh(ms)) {
-      nir[MESA_SHADER_VERTEX] =
-         tu_aqe_build_vs(ir3_get_compiler_options(dev->compiler), verts_per_prim == 1);
+       tu_aqe_lower_mesh(ms, &aqe_io, &aqe_vs, nir[MESA_SHADER_FRAGMENT])) {
+      nir[MESA_SHADER_VERTEX] = aqe_vs;
       ralloc_steal(mem_ctx, nir[MESA_SHADER_VERTEX]);
       info[MESA_SHADER_MESH].mesh = (struct tu_mesh_state) {
-         .stride = uint32_t(max_vertices) * 16,
+         .stride = uint32_t(max_vertices) * aqe_io.count * 16,
          .chunk_workgroups = 256,
          .max_primitives = max_primitives,
+         .aqe_vertex_stride = uint16_t(aqe_io.count * 16),
          .verts_per_prim = verts_per_prim,
          .topology = uint8_t(verts_per_prim == 3 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST :
             verts_per_prim == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_POINT_LIST),
@@ -4153,6 +4156,39 @@ tu_compile_shaders(struct tu_device *device,
       }
 
       stage_feedbacks[stage].duration += os_time_get_nano() - stage_start;
+   }
+
+   if (shaders[MESA_SHADER_MESH] && shaders[MESA_SHADER_MESH]->mesh.native_aqe) {
+      const struct tu_shader *ms = shaders[MESA_SHADER_MESH];
+      const struct tu_aqe_bo binary = {ms->binary_iova, ms->variant->info.size};
+      struct tu_aqe_stage stage;
+      if (!tu_aqe_build_triangle_stage(ms->variant, &binary, &stage)) {
+         struct tu_shader_key fallback_keys[MESA_SHADER_MESH_STAGES];
+         memcpy(fallback_keys, keys, sizeof(fallback_keys));
+         fallback_keys[MESA_SHADER_MESH].mesh_aqe = false;
+         for (unsigned i = 0; i < MESA_SHADER_MESH_STAGES; i++) {
+            if (shaders[i]) {
+               vk_pipeline_cache_object_unref(&device->vk, &shaders[i]->base);
+               shaders[i] = NULL;
+            }
+            if (nir_out) {
+               ralloc_free(nir_out[i]);
+               nir_out[i] = NULL;
+            }
+            if (nir_initial_disasm) {
+               ralloc_free(nir_initial_disasm[i]);
+               nir_initial_disasm[i] = NULL;
+            }
+            nir[i] = NULL;
+         }
+         ralloc_free(mem_ctx);
+         if (TU_DEBUG(MESH))
+            mesa_logi("native AQE compile fallback: IR3 stage contract");
+         return tu_compile_shaders(device, pipeline_flags, stage_infos, nir,
+                                   fallback_keys, layout, pipeline_blake3, shaders,
+                                   nir_initial_disasm, nir_initial_disasm_mem_ctx,
+                                   nir_out, stage_feedbacks);
+      }
    }
 
    ralloc_free(mem_ctx);

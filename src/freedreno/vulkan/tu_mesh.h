@@ -115,6 +115,7 @@ struct tu_mesh_state {
    uint32_t task_launch_dim_bound[3];
    uint32_t task_launch_pc[3];
    uint16_t max_primitives;
+   uint16_t aqe_vertex_stride;
    uint8_t verts_per_prim;
    uint8_t topology;
    bool native_aqe;

@@ -3,6 +3,31 @@
 
 #include "nir/nir_builder.h"
 
+struct aqe_lowering_state {
+   struct tu_aqe_layout layout;
+   struct tu_aqe_vertex_io io;
+};
+
+bool
+tu_aqe_fragment_supported(const nir_shader *fs)
+{
+   if (!fs)
+      return true;
+   nir_foreach_variable_with_modes(var, fs, nir_var_shader_in) {
+      if (var->data.per_primitive ||
+          var->data.location == VARYING_SLOT_PRIMITIVE_ID ||
+          var->data.location == VARYING_SLOT_LAYER ||
+          var->data.location == VARYING_SLOT_VIEWPORT ||
+          var->data.location == VARYING_SLOT_CLIP_DIST0 ||
+          var->data.location == VARYING_SLOT_CLIP_DIST1 ||
+          var->data.location == VARYING_SLOT_CULL_DIST0 ||
+          var->data.location == VARYING_SLOT_CULL_DIST1)
+         return false;
+   }
+   return !BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID) &&
+          !BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_LAYER_ID);
+}
+
 static bool
 aqe_output_access(nir_intrinsic_instr *intr, nir_variable **var,
                   nir_deref_instr **element)
@@ -49,7 +74,8 @@ lower_aqe_workgroup_id(nir_builder *b, nir_intrinsic_instr *intr, void *)
 static bool
 lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   const auto *layout = (const struct tu_aqe_layout *) data;
+   const auto *state = (const struct aqe_lowering_state *) data;
+   const struct tu_aqe_layout *layout = &state->layout;
    b->cursor = nir_before_instr(&intr->instr);
    nir_variable *var;
    nir_deref_instr *element;
@@ -59,16 +85,18 @@ lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          return true;
       }
       nir_def *group = nir_channel(b, nir_load_workgroup_id(b), 0);
-      bool position = var->data.location == VARYING_SLOT_POS;
-      unsigned group_stride = position ? layout->max_vertices * layout->vertex_stride :
+      bool vertex = var->data.location != VARYING_SLOT_PRIMITIVE_INDICES;
+      unsigned group_stride = vertex ? layout->max_vertices * layout->vertex_stride :
                                          layout->index_stride;
-      unsigned element_stride = position ? layout->vertex_stride :
+      unsigned element_stride = vertex ? layout->vertex_stride :
          layout->topology == TU_AQE_POINTS ? 2u : (8u - 2 * layout->topology);
       nir_def *offset = nir_iadd(b, nir_imul_imm(b, group, group_stride),
          nir_imul_imm(b, element->arr.index.ssa, element_stride));
+      if (vertex)
+         offset = nir_iadd_imm(b, offset, 16 * state->io.slots[var->data.location]);
       nir_def *value = intr->src[1].ssa;
       unsigned write_mask = nir_intrinsic_write_mask(intr);
-      if (!position) {
+      if (!vertex) {
          if (layout->topology != TU_AQE_POINTS) {
             nir_def *components[4];
             unsigned count = value->num_components;
@@ -80,9 +108,9 @@ lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          }
          value = nir_u2u16(b, value);
       }
-      nir_store_global(b, value, aqe_address(b, position ? 4 : 8, offset),
+      nir_store_global(b, value, aqe_address(b, vertex ? 4 : 8, offset),
                        .write_mask = write_mask,
-                       .align_mul = position ? 16u : 2u);
+                       .align_mul = vertex ? 16u : 2u);
       nir_instr_remove(&intr->instr);
       return true;
    }
@@ -122,8 +150,45 @@ lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return false;
 }
 
+static nir_shader *
+build_vertex_bridge(const nir_shader *ms, const struct tu_aqe_vertex_io *io)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, ms->options,
+                                                 "aqe_vertex_fetch");
+   bool position = false;
+   nir_foreach_variable_with_modes(var, ms, nir_var_shader_out) {
+      if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES ||
+          var->data.location == VARYING_SLOT_PSIZ)
+         continue;
+      nir_variable *out = nir_variable_clone(var, b.shader);
+      out->type = glsl_get_array_element(var->type);
+      nir_shader_add_variable(b.shader, out);
+      nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
+                                               glsl_uvec4_type(), "attribute");
+      in->data.location = VERT_ATTRIB_GENERIC0 + io->slots[var->data.location];
+      unsigned components = glsl_get_vector_elements(out->type);
+      nir_store_var(&b, out, nir_trim_vector(&b, nir_load_var(&b, in), components),
+                    BITFIELD_MASK(components));
+      position |= var->data.location == VARYING_SLOT_POS;
+   }
+   if (!position) {
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                                glsl_vec4_type(), "position");
+      out->data.location = VARYING_SLOT_POS;
+      nir_store_var(&b, out, nir_imm_vec4(&b, 2, 2, 0, 1), 0xf);
+   }
+   if (ms->info.mesh.primitive_type == MESA_PRIM_POINTS) {
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                                glsl_float_type(), "point_size");
+      out->data.location = VARYING_SLOT_PSIZ;
+      nir_store_var(&b, out, nir_imm_float(&b, 1), 1);
+   }
+   return b.shader;
+}
+
 bool
-tu_aqe_lower_mesh(nir_shader *ms)
+tu_aqe_lower_mesh(nir_shader *ms, struct tu_aqe_vertex_io *io_out,
+                  nir_shader **vs_out, nir_shader *fs)
 {
    if (ms->info.stage != MESA_SHADER_MESH ||
        !ms->info.mesh.max_vertices_out || ms->info.mesh.max_vertices_out > 128 ||
@@ -135,29 +200,28 @@ tu_aqe_lower_mesh(nir_shader *ms)
        ms->info.workgroup_size[1] != 1 ||
        ms->info.workgroup_size[2] != 1 || ms->info.shared_size ||
        ms->info.num_ubos || ms->info.num_ssbos || ms->info.num_images ||
-       ms->info.num_textures)
+       ms->info.num_textures || !tu_aqe_fragment_supported(fs))
       return false;
    const unsigned vertices_per_primitive =
       ms->info.mesh.primitive_type == MESA_PRIM_TRIANGLES ? 3 :
       ms->info.mesh.primitive_type == MESA_PRIM_LINES ? 2 : 1;
-   struct tu_aqe_layout layout;
-   if (!tu_aqe_layout_for(ms->info.mesh.max_vertices_out,
-                          ms->info.mesh.max_primitives_out,
-                          (enum tu_aqe_topology) (3 - vertices_per_primitive),
-                          16, 256, 256, &layout))
-      return false;
    nir_foreach_variable_with_modes(var, ms, nir_var_shader_out) {
+      bool indices = var->data.location == VARYING_SLOT_PRIMITIVE_INDICES;
+      bool user = var->data.location >= VARYING_SLOT_VAR0 &&
+                  var->data.location < VARYING_SLOT_MAX;
       if (!glsl_type_is_array(var->type) ||
           var->data.compact || var->data.location_frac ||
+          (var->data.per_primitive && !indices) ||
           (var->data.location != VARYING_SLOT_POS &&
            var->data.location != VARYING_SLOT_PSIZ &&
-           var->data.location != VARYING_SLOT_PRIMITIVE_INDICES))
+           !indices && !user))
          return false;
       const glsl_type *type = glsl_get_array_element(var->type);
-      if (glsl_get_bit_size(type) != 32 ||
-          glsl_get_vector_elements(type) !=
+      if ((!glsl_type_is_scalar(type) && !glsl_type_is_vector(type)) ||
+          glsl_get_bit_size(type) != 32 ||
+          (!user && glsl_get_vector_elements(type) !=
              (var->data.location == VARYING_SLOT_POS ? 4 :
-              var->data.location == VARYING_SLOT_PSIZ ? 1 : vertices_per_primitive))
+              var->data.location == VARYING_SLOT_PSIZ ? 1 : vertices_per_primitive)))
          return false;
    }
    nir_foreach_function_impl(impl, ms) {
@@ -209,8 +273,32 @@ tu_aqe_lower_mesh(nir_shader *ms)
          }
       }
    }
+   if (fs) {
+      nir_remove_unused_varyings(ms, fs);
+      NIR_PASS(_, ms, nir_remove_dead_variables, nir_var_shader_temp, NULL);
+   }
+   struct aqe_lowering_state state = {};
+   memset(state.io.slots, UINT8_MAX, sizeof(state.io.slots));
+   state.io.slots[VARYING_SLOT_POS] = 0;
+   state.io.count = 1;
+   nir_foreach_variable_with_modes(var, ms, nir_var_shader_out) {
+      if (var->data.location >= VARYING_SLOT_VAR0) {
+         if (state.io.count == 32)
+            return false;
+         state.io.slots[var->data.location] = state.io.count++;
+      }
+   }
+   if (!tu_aqe_layout_for(ms->info.mesh.max_vertices_out,
+                          ms->info.mesh.max_primitives_out,
+                          (enum tu_aqe_topology) (3 - vertices_per_primitive),
+                          state.io.count * 16, 256, 256, &state.layout))
+      return false;
+   if (vs_out)
+      *vs_out = build_vertex_bridge(ms, &state.io);
+   if (io_out)
+      *io_out = state.io;
    nir_shader_intrinsics_pass(ms, lower_aqe_workgroup_id, nir_metadata_none, NULL);
-   nir_shader_intrinsics_pass(ms, lower_aqe_intrinsic, nir_metadata_none, &layout);
+   nir_shader_intrinsics_pass(ms, lower_aqe_intrinsic, nir_metadata_none, &state);
    NIR_PASS(_, ms, nir_remove_dead_derefs);
    NIR_PASS(_, ms, nir_remove_dead_variables, nir_var_shader_out, NULL);
    ms->info.stage = MESA_SHADER_COMPUTE;

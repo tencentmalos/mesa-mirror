@@ -10909,9 +10909,10 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
           (draws > 1 && (draw->stride < 12 || draw->stride % 4)))) ||
        (draw->count && (!draw->indirect || draw->count % 4 ||
           draw->count > address_limit - 4)) ||
-       !tu_aqe_layout_for(ms->mesh.stride / 16, ms->mesh.max_primitives,
+       !ms->mesh.aqe_vertex_stride ||
+       !tu_aqe_layout_for(ms->mesh.stride / ms->mesh.aqe_vertex_stride, ms->mesh.max_primitives,
                           (enum tu_aqe_topology) (3 - ms->mesh.verts_per_prim),
-                          16, 256, 256, &layout) ||
+                          ms->mesh.aqe_vertex_stride, 256, 256, &layout) ||
        !tu_aqe_build_triangle_stage(ms->variant, &binary, &stage)) {
       mesa_loge("AQE draw rejected before submission");
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -10938,11 +10939,16 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    tu_mesh_emit_program<CHIP>(cmd, cs, ms);
 
    struct tu_cs input_cs;
-   struct tu_draw_state input = tu_cs_draw_state(&cmd->sub_cs, &input_cs, 7);
-   tu_cs_emit_regs(&input_cs, A6XX_VFD_VERTEX_BUFFER_STRIDE(0, 16));
-   tu_cs_emit_pkt4(&input_cs, REG_A6XX_VFD_FETCH_INSTR_INSTR(0), 2);
-   tu_cs_emit(&input_cs, 0x48300000);
-   tu_cs_emit(&input_cs, 0);
+   unsigned attributes = ms->mesh.aqe_vertex_stride / 16;
+   struct tu_draw_state input = tu_cs_draw_state(&cmd->sub_cs, &input_cs, 5 + 2 * attributes);
+   tu_cs_emit_regs(&input_cs, A6XX_VFD_VERTEX_BUFFER_STRIDE(0, ms->mesh.aqe_vertex_stride));
+   tu_cs_emit_pkt4(&input_cs, REG_A6XX_VFD_FETCH_INSTR_INSTR(0), 2 * attributes);
+   for (unsigned i = 0; i < attributes; i++) {
+      tu_cs_emit(&input_cs, A6XX_VFD_FETCH_INSTR_INSTR(0,
+         .idx = 0, .offset = 16 * i, .format = FMT6_32_32_32_32_UINT,
+         .swap = WZYX, .unk30 = 1, ._float = false).value);
+      tu_cs_emit(&input_cs, 0);
+   }
    tu_cs_emit_regs(&input_cs, VPC_UNKNOWN_CNTL(CHIP, 1));
    tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 9);
    tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + TU_DYNAMIC_STATE_VERTEX_INPUT, input);
