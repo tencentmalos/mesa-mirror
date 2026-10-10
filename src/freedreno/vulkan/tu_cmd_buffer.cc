@@ -10897,11 +10897,6 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    const uint32_t draws = draw->indirect ? draw->draw_count : 1;
    const uint64_t address_limit = 1ull << 49;
    const uint64_t indirect_bytes = uint64_t(draws ? draws - 1 : 0) * draw->stride + 12;
-   if (draw->count && !debug_get_bool_option("TU_EXPERIMENTAL_MESH_AQE_COUNT", false)) {
-      mesa_loge("Native AQE count requires separate experimental opt-in");
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
-   }
    if (CHIP != A8XX || !arena || cmd->state.vk_mv.view_mask ||
        !draws || draws >= (1u << 31) ||
        (draw->indirect && (draw->indirect % 4 || draw->indirect >= address_limit ||
