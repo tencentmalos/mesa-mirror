@@ -4,6 +4,8 @@
 
 #include "tu_mesh_aqe.h"
 #include "tu_mesh_aqe_nir.h"
+#include "tu_mesh_aqe_state.h"
+#include "freedreno_pm4.h"
 #include "ir3/ir3_nir.h"
 #include "ir3/ir3_shader.h"
 
@@ -117,6 +119,88 @@ test_packet(const char *directory)
 }
 
 static void
+test_stage(const ir3_shader_variant *v, const char *directory)
+{
+   tu_aqe_bo binary = {0x345600000000ull, v->info.size};
+   tu_aqe_stage stage;
+   CHECK(tu_aqe_build_triangle_stage(v, &binary, &stage));
+   CHECK(stage.dwords == 39 && stage.ndrange == 0x7d);
+   CHECK(stage.words[0] == pm4_pkt7_hdr(CP_CONTEXT_REG_BUNCH, 36));
+   CHECK(stage.words[37] == 0x48a9d401 && stage.words[38] == 0x7d);
+   auto reg = [&](unsigned address) {
+      unsigned hits = 0;
+      uint32_t result = 0;
+      for (unsigned i = 1; i < 37; i += 2) {
+         if (stage.words[i] == address) { hits++; result = stage.words[i + 1]; }
+      }
+      CHECK(hits == 1);
+      return result;
+   };
+   CHECK((uint64_t(reg(0xa9b5)) << 32 | reg(0xa9b4)) == binary.iova);
+   CHECK(reg(0xa9bc) * 128 <= binary.size);
+   CHECK(((reg(0xa9cd) & 0xff) * 4) == v->constlen);
+   CHECK(reg(0xa9cd) & 0x100);
+   CHECK((reg(0xa9c2) & 0xff) == ir3_find_sysval_regid(v, SYSTEM_VALUE_WORKGROUP_ID));
+   CHECK((reg(0xa9c2) >> 24) == ir3_find_sysval_regid(v, SYSTEM_VALUE_LOCAL_INVOCATION_ID));
+   CHECK(((reg(0xa9b0) >> 7) & 0x3f) == v->info.max_reg + 1);
+   CHECK(reg(0xa9b6) == 0 && reg(0xa9b7) == 0 && reg(0xa9b8) == 0);
+   CHECK(reg(0xa9b9) == 0 && reg(0xa9bd) == 0);
+
+   tu_aqe_layout layout;
+   CHECK(tu_aqe_triangle_layout(256, 256, &layout));
+   tu_aqe_triangle_draw draw = {
+      .arena = {0x123400000000ull, layout.size},
+      .parameters = {0x234500000000ull, 4 * (TU_AQE_HEADER_DWORDS + stage.dwords)},
+      .state_offset = 104, .state_dwords = stage.dwords, .groups = {1, 1, 1},
+   };
+   uint32_t blob[TU_AQE_HEADER_DWORDS + 64] = {}, packet[TU_AQE_PACKET_DWORDS];
+   CHECK(tu_aqe_build_triangle(&draw, &layout, blob, packet));
+   CHECK(blob[19] == stage.ndrange && blob[6] == stage.dwords);
+   memcpy(blob + TU_AQE_HEADER_DWORDS, stage.words, stage.dwords * 4);
+   if (directory) {
+      char path[4096];
+      snprintf(path, sizeof(path), "%s/triangle.stage", directory);
+      FILE *f = fopen(path, "wb");
+      CHECK(f && fwrite(stage.words, stage.dwords * 4, 1, f) == 1);
+      CHECK(fclose(f) == 0);
+      snprintf(path, sizeof(path), "%s/triangle.parameters", directory);
+      f = fopen(path, "wb");
+      CHECK(f && fwrite(blob, draw.parameters.size, 1, f) == 1);
+      CHECK(fclose(f) == 0);
+   }
+
+   auto variant = *v;
+   const auto good_binary = binary;
+   auto reject = [&]() {
+      memset(&stage, 0xa5, sizeof(stage));
+      CHECK(!tu_aqe_build_triangle_stage(&variant, &binary, &stage));
+      const auto *bytes = reinterpret_cast<const unsigned char *>(&stage);
+      for (unsigned i = 0; i < sizeof(stage); i++) CHECK(bytes[i] == 0xa5);
+      variant = *v;
+      binary = good_binary;
+   };
+   binary.iova += 4; reject();
+   binary.size--; reject();
+   binary.iova = (1ull << 49) - 128; reject();
+   binary.iova = 0; reject();
+   variant.local_size[0] = 64; reject();
+   variant.local_size_variable = true; reject();
+   variant.type = MESA_SHADER_VERTEX; reject();
+   variant.pvtmem_size = 4; reject();
+   variant.shared_size = 4; reject();
+   variant.bindless_ubo = true; reject();
+   variant.constlen = 4; reject();
+   variant.constlen = 17; reject();
+   variant.constlen = 132; reject();
+   variant.need_driver_params = true; reject();
+   variant.constant_data_size = 4; reject();
+   variant.num_samp = 1; reject();
+   variant.instrlen = UINT32_MAX; reject();
+   variant.info.max_reg = 63; reject();
+   variant.info.max_half_reg = 63; reject();
+}
+
+static void
 test_shader(const char *directory)
 {
    glsl_type_singleton_init_or_ref();
@@ -146,6 +230,7 @@ test_shader(const char *directory)
    CHECK(strstr(v->disasm_info.disasm, "c2.z"));
    CHECK(strstr(v->disasm_info.disasm, "stg"));
    CHECK(strstr(v->disasm_info.disasm, "stg.u16"));
+   test_stage(v, directory);
    if (directory) {
       char path[4096];
       snprintf(path, sizeof(path), "%s/triangle.cs", directory);

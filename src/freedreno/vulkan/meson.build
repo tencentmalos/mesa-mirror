@@ -53,6 +53,7 @@ libtu_files = files(
   'tu_mesh.cc',
   'tu_mesh_aqe.cc',
   'tu_mesh_aqe_nir.cc',
+  'tu_mesh_aqe_state.cc',
   'tu_nir_lower_demote_samples.cc',
   'tu_nir_lower_multiview.cc',
   'tu_nir_lower_ray_query.cc',
@@ -301,7 +302,8 @@ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 if with_tests
   test('tu_mesh_aqe', executable(
     'tu_mesh_aqe_test',
-    ['tests/mesh_aqe_test.cpp', 'tu_mesh_aqe.cc', 'tu_mesh_aqe_nir.cc'],
+    ['tests/mesh_aqe_test.cpp', 'tu_mesh_aqe.cc', 'tu_mesh_aqe_nir.cc',
+     'tu_mesh_aqe_state.cc', freedreno_xml_header_files],
     include_directories : libtu_includes,
     link_with : [libfreedreno_ir3],
     dependencies : [idep_nir, idep_mesautil],
