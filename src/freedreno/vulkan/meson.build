@@ -51,6 +51,8 @@ libtu_files = files(
   'tu_knl.cc',
   'tu_lrz.cc',
   'tu_mesh.cc',
+  'tu_mesh_aqe.cc',
+  'tu_mesh_aqe_nir.cc',
   'tu_nir_lower_demote_samples.cc',
   'tu_nir_lower_multiview.cc',
   'tu_nir_lower_ray_query.cc',
@@ -297,6 +299,14 @@ _dev_icd = custom_target(
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 
 if with_tests
+  test('tu_mesh_aqe', executable(
+    'tu_mesh_aqe_test',
+    ['tests/mesh_aqe_test.cpp', 'tu_mesh_aqe.cc', 'tu_mesh_aqe_nir.cc'],
+    include_directories : libtu_includes,
+    link_with : [libfreedreno_ir3],
+    dependencies : [idep_nir, idep_mesautil],
+    cpp_args : [tu_cpp_args, tu_flags],
+  ), suite : ['freedreno'])
   test('tu_mesh_query', executable(
     'tu_mesh_query_test',
     ['tests/mesh_query_test.cpp', 'tu_mesh.cc', tu_entrypoints[0],
