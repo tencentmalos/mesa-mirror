@@ -1915,8 +1915,6 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
       }
 
       if (nir[MESA_SHADER_MESH] || stage_infos[MESA_SHADER_MESH]) {
-         keys[MESA_SHADER_VERTEX].multiview_mask =
-            builder->graphics_state.mv->view_mask;
          keys[MESA_SHADER_MESH].multiview_mask =
             builder->graphics_state.mv->view_mask;
          keys[MESA_SHADER_TASK].multiview_mask =
@@ -1933,6 +1931,10 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
 
       keys[last_pre_rast_stage].fdm_per_layer = builder->fdm_per_layer;
    }
+
+   if (nir[MESA_SHADER_MESH] || stage_infos[MESA_SHADER_MESH])
+      keys[MESA_SHADER_VERTEX].multiview_mask =
+         keys[MESA_SHADER_MESH].multiview_mask;
 
    if (builder->state & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
       keys[MESA_SHADER_FRAGMENT].multiview_mask =
