@@ -111,11 +111,19 @@ test_packet(const char *directory)
    d.state_dwords = 1u << 20; reject();
    d.state_dwords = 0; reject();
    d.groups[0] = 0; reject();
-   d.groups[0] = 257; reject();
+   d.groups[0] = 65536; reject();
    d.groups[0] = UINT32_MAX; reject();
-   d.groups[0] = 16; d.groups[1] = 16;
-   CHECK(tu_aqe_build_triangle(&d, &layout, h, p));
+   const uint32_t dimensions[][3] = {
+      {255, 1, 1}, {256, 1, 1}, {257, 1, 1}, {17, 17, 3},
+      {65535, 3, 1}, {16384, 256, 1},
+   };
+   for (const auto &groups : dimensions) {
+      memcpy(d.groups, groups, sizeof(groups));
+      CHECK(tu_aqe_build_triangle(&d, &layout, h, p));
+      CHECK(!memcmp(p + 2, groups, sizeof(groups)));
+   }
    d.groups[2] = 2; reject();
+   d.groups[0] = d.groups[1] = d.groups[2] = 65535; reject();
    layout.regions[TU_AQE_COUNTS].offset += 32; reject();
 }
 
@@ -220,15 +228,23 @@ test_lowering(ir3_compiler *compiler)
    nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3), nir_imm_int(&b, 1),
                                       nir_imm_int(&b, 1));
    nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_variable *group_var = nir_variable_create(b.shader, nir_var_system_value,
+      glsl_vector_type(GLSL_TYPE_UINT, 3), "gl_WorkGroupID");
+   group_var->data.location = SYSTEM_VALUE_WORKGROUP_ID;
+   nir_def *group = nir_load_var(&b, group_var);
+   nir_def *dimensions = nir_load_num_workgroups(&b);
    nir_push_if(&b, nir_ult_imm(&b, lane, 3));
    nir_store_array_var(&b, pos, lane,
-      nir_vec4(&b, nir_u2f32(&b, lane), nir_imm_float(&b, 0.5),
-               nir_imm_float(&b, 0), nir_imm_float(&b, 1)), 0xf);
+      nir_vec4(&b, nir_u2f32(&b, nir_channel(&b, group, 0)),
+               nir_u2f32(&b, nir_channel(&b, group, 1)),
+               nir_u2f32(&b, nir_channel(&b, group, 2)),
+               nir_u2f32(&b, nir_channel(&b, dimensions, 2))), 0xf);
    nir_pop_if(&b, NULL);
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_store_array_var_imm(&b, idx, 0, nir_imm_ivec3(&b, 2, 0, 1), 7);
    nir_pop_if(&b, NULL);
 
+   NIR_PASS(_, b.shader, nir_lower_system_values);
    b.shader->info.mesh.max_vertices_out = 4;
    CHECK(!tu_aqe_lower_mesh(b.shader));
    CHECK(b.shader->info.stage == MESA_SHADER_MESH);
@@ -247,6 +263,7 @@ test_lowering(ir3_compiler *compiler)
             auto *intr = nir_instr_as_intrinsic(instr);
             CHECK(intr->intrinsic != nir_intrinsic_set_vertex_and_primitive_count);
             CHECK(intr->intrinsic != nir_intrinsic_store_deref);
+            CHECK(intr->intrinsic != nir_intrinsic_load_base_workgroup_id);
             if (intr->intrinsic == nir_intrinsic_store_global) {
                stores++;
                index_stores += intr->src[0].ssa->bit_size == 16;

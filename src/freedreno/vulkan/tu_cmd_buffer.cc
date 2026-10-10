@@ -10895,7 +10895,6 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    struct tu_aqe_layout layout;
    struct tu_aqe_bo binary = { ms->binary_iova, ms->variant->info.size };
    if (CHIP != A8XX || !arena || draw->indirect || cmd->state.vk_mv.view_mask ||
-       draw->groups[1] != 1 || draw->groups[2] != 1 ||
        !tu_aqe_triangle_layout(256, 256, &layout) ||
        !tu_aqe_build_triangle_stage(ms->variant, &binary, &stage)) {
       mesa_loge("AQE draw rejected before submission");
@@ -10948,10 +10947,11 @@ tu_mesh_draw_aqe(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
    cmd->state.compute_program_stale = true;
    cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS | TU_CMD_DIRTY_DRAW_STATE;
    cmd->mesh_stats.draws++;
-   cmd->mesh_stats.chunks++;
+   cmd->mesh_stats.chunks += DIV_ROUND_UP(
+      draw->groups[0] * draw->groups[1] * draw->groups[2], layout.mesh_capacity);
    if (TU_DEBUG(MESH))
-      fprintf(stderr, "mesh backend=native-aqe packet=0x7a groups=%u stage_dwords=%u\n",
-                draw->groups[0], stage.dwords);
+      fprintf(stderr, "mesh backend=native-aqe packet=0x7a groups=%u,%u,%u stage_dwords=%u\n",
+                draw->groups[0], draw->groups[1], draw->groups[2], stage.dwords);
    trace_end_draw(&cmd->rp_trace, cs);
 }
 

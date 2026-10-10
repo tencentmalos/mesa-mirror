@@ -29,6 +29,23 @@ aqe_address(nir_builder *b, unsigned dword, nir_def *offset)
 }
 
 static bool
+lower_aqe_workgroup_id(nir_builder *b, nir_intrinsic_instr *intr, void *)
+{
+   if (intr->intrinsic != nir_intrinsic_load_workgroup_id)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *linear = nir_iadd(b, nir_channel(b, &intr->def, 0),
+      nir_imul(b, aqe_constant(b, 1, 0), aqe_constant(b, 1, 1)));
+   nir_def *x = aqe_constant(b, 1, 15);
+   nir_def *y = aqe_constant(b, 1, 16);
+   nir_def *yz = nir_udiv(b, linear, x);
+   nir_def *value = nir_vec3(b, nir_umod(b, linear, x), nir_umod(b, yz, y),
+                               nir_udiv(b, yz, y));
+   nir_def_rewrite_uses_after(&intr->def, value);
+   return true;
+}
+
+static bool
 lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *)
 {
    b->cursor = nir_before_instr(&intr->instr);
@@ -65,6 +82,10 @@ lower_aqe_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *)
       nir_def *value = nir_vec3(b, aqe_constant(b, 1, 15),
          aqe_constant(b, 1, 16), aqe_constant(b, 1, 17));
       nir_def_replace(&intr->def, value);
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_load_base_workgroup_id) {
+      nir_def_replace(&intr->def, nir_imm_zero(b, 3, intr->def.bit_size));
       return true;
    }
    if (intr->intrinsic == nir_intrinsic_load_local_invocation_index) {
@@ -113,6 +134,7 @@ tu_aqe_lower_mesh(nir_shader *ms)
             case nir_intrinsic_store_deref:
             case nir_intrinsic_copy_deref:
             case nir_intrinsic_load_workgroup_id:
+            case nir_intrinsic_load_base_workgroup_id:
             case nir_intrinsic_load_local_invocation_id:
             case nir_intrinsic_load_local_invocation_index:
             case nir_intrinsic_load_num_workgroups:
@@ -143,6 +165,7 @@ tu_aqe_lower_mesh(nir_shader *ms)
          }
       }
    }
+   nir_shader_intrinsics_pass(ms, lower_aqe_workgroup_id, nir_metadata_none, NULL);
    nir_shader_intrinsics_pass(ms, lower_aqe_intrinsic, nir_metadata_none, NULL);
    NIR_PASS(_, ms, nir_remove_dead_derefs);
    NIR_PASS(_, ms, nir_remove_dead_variables, nir_var_shader_out, NULL);

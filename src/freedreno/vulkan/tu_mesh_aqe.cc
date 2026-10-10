@@ -85,7 +85,7 @@ tu_aqe_build_triangle(const struct tu_aqe_triangle_draw *draw,
          return false;
       total *= draw->groups[i];
    }
-   if (total > layout->mesh_capacity)
+   if (total > (1u << 22))
       return false;
 
    uint32_t h[TU_AQE_HEADER_DWORDS] = {};
