@@ -544,6 +544,10 @@ struct tu_cmd_state
    struct tu_draw_state desc_sets;
    struct tu_draw_state load_state;
    struct tu_draw_state compute_load_state;
+   /* cmd->cs position right after the compute shader state was last
+    * emitted by a bind or a dispatch; see the A8XX workaround in
+    * tu_dispatch().
+    */
    const uint32_t *compute_state_end;
    struct tu_draw_state prim_order_gmem;
 

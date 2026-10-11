@@ -9821,7 +9821,19 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    if (cmd->device->dbg_renderpass_stomp_cs) {
       tu_cs_emit_state_ib(&cmd->cs, shader->state);
       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
-   } else if (CHIP >= A8XX && cs->cur != cmd->state.compute_state_end) {
+   } else if (CHIP >= A8XX && !TU_DEBUG(NO_CS_REEMIT) &&
+              cs->cur != cmd->state.compute_state_end) {
+      /* shadPS4 workaround (Odin3 / Adreno 830, Kingdom Hearts III loading
+       * hang): the compute pipeline registers do not survive the work
+       * recorded between a compute bind and a later dispatch. KGSL
+       * snapshots of the hang show SP_CS_CONFIG, SP_CS_INSTR_SIZE,
+       * SP_CS_CNTL_0/1 and SP_CS_CONST_CONFIG as zero, with SP_CS_BASE
+       * kept, for a dispatch recorded after render passes and blits
+       * without a rebind, and the dispatch never completes. The gen8.0
+       * context switch probably does not keep them. Re-emit the shader and
+       * its load state when anything was recorded since they were last
+       * emitted; back-to-back dispatches skip this.
+       */
       tu_cs_emit_state_ib(cs, shader->state);
       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
    }
