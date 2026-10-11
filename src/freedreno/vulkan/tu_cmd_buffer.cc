@@ -5642,6 +5642,7 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
       tu_cs_emit_state_ib(&cmd->cs,
                           pipeline->shaders[MESA_SHADER_COMPUTE]->state);
       cmd->state.compute_load_state = pipeline->load_state;
+      cmd->state.compute_state_end = cmd->cs.cur;
       return;
    }
 
@@ -9820,6 +9821,9 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    if (cmd->device->dbg_renderpass_stomp_cs) {
       tu_cs_emit_state_ib(&cmd->cs, shader->state);
       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+   } else if (CHIP >= A8XX && cs->cur != cmd->state.compute_state_end) {
+      tu_cs_emit_state_ib(cs, shader->state);
+      cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
    }
 
    /* There appears to be a HW bug where in some rare circumstances it appears
@@ -10063,6 +10067,7 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
    }
 
+   cmd->state.compute_state_end = cs->cur;
    cmd->state.total_dispatches++;
 }
 
