@@ -355,20 +355,59 @@ kgsl_bo_init(struct tu_device *dev,
 
    req.flags |= kgsl_align_flag(align);
 
-   /* Forcing everything in the first 4GB is overkill, but we don't have many
-    * other options here since we don't control iova addresses and kgsl
-    * doesn't have a flag to avoid 32B rollover.
-    */
-   if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER)
-      req.flags |= KGSL_MEMFLAGS_FORCE_32BIT;
-
    int ret;
+   if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER) {
+      uint32_t rejected[4] = {};
+      unsigned rejected_count = 0;
+      int allocation_error = 0;
+      for (unsigned attempt = 0; attempt < ARRAY_SIZE(rejected); ++attempt) {
+         struct kgsl_gpuobj_alloc alloc = {
+            .size = size,
+            .flags = uint64_t(req.flags),
+         };
+         ret = safe_ioctl(dev->physical_device->local_fd,
+                          IOCTL_KGSL_GPUOBJ_ALLOC, &alloc);
+         if (ret) {
+            allocation_error = errno;
+            break;
+         }
 
-   ret = safe_ioctl(dev->physical_device->local_fd,
-                    IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
-   if (ret) {
-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
+         struct kgsl_gpuobj_info info = { .id = alloc.id };
+         ret = safe_ioctl(dev->physical_device->local_fd,
+                          IOCTL_KGSL_GPUOBJ_INFO, &info);
+         if (ret) {
+            allocation_error = errno;
+            rejected[rejected_count++] = alloc.id;
+            break;
+         }
+         if (!info.gpuaddr || !alloc.size ||
+             alloc.size - 1 > UINT64_MAX - info.gpuaddr ||
+             (info.gpuaddr >> 32) != ((info.gpuaddr + alloc.size - 1) >> 32)) {
+            rejected[rejected_count++] = alloc.id;
+            continue;
+         }
+         req.id = alloc.id;
+         req.mmapsize = alloc.mmapsize;
+         req.gpuaddr = info.gpuaddr;
+         break;
+      }
+      for (unsigned i = 0; i < rejected_count; ++i) {
+         struct kgsl_gpumem_free_id free_req = { .id = rejected[i] };
+         safe_ioctl(dev->physical_device->local_fd,
+                    IOCTL_KGSL_GPUMEM_FREE_ID, &free_req);
+      }
+      if (!req.id) {
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Command buffer allocation without 4 GiB rollover failed (%s)",
+                          strerror(allocation_error ? allocation_error : ENOSPC));
+      }
+   } else {
+      ret = safe_ioctl(dev->physical_device->local_fd,
+                       IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
+      if (ret) {
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
+      }
    }
 
    struct tu_bo* bo = tu_device_lookup_bo(dev, req.id);
