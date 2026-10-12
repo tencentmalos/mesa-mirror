@@ -9615,11 +9615,24 @@ build_driver_params_cs(const struct ir3_shader_variant *variant,
    };
 }
 
+/* Indirect dispatches whose driver params cannot be loaded straight from the
+ * indirect buffer first copy them to an aligned scratch slot, which needs
+ * CP_WAIT_FOR_IDLE. TU_DP_COPY emits only that copy and TU_DP_LOAD only the
+ * loads, so that the A8XX compute state re-emit in tu_dispatch() can go
+ * between them (shadPS4 workaround, see there).
+ */
+enum tu_dp_phase {
+   TU_DP_ALL,
+   TU_DP_COPY,
+   TU_DP_LOAD,
+};
+
 template <chip CHIP>
 static void
 tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
                               struct tu_cs *cs,
-                              const struct tu_dispatch_info *info)
+                              const struct tu_dispatch_info *info,
+                              enum tu_dp_phase phase)
 {
    mesa_shader_stage type = MESA_SHADER_COMPUTE;
    const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
@@ -9636,6 +9649,8 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
       bool direct_indirect_load =
          !(info->indirect & 0xf) &&
          !(info->indirect && num_consts > IR3_DP_CS(base_group_x));
+      if (phase == TU_DP_COPY && (!info->indirect || direct_indirect_load))
+         return;
 
       uint64_t iova = 0;
 
@@ -9663,37 +9678,41 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
 
          uint64_t indirect_iova = info->indirect;
 
-         /* Wait for any previous uses to finish. */
-         tu_cs_emit_wfi(cs);
+         if (phase != TU_DP_LOAD) {
+            /* Wait for any previous uses to finish. */
+            tu_cs_emit_wfi(cs);
 
-         for (uint32_t i = 0; i < 3; i++) {
-            tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
-            tu_cs_emit(cs, 0);
-            tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, i));
-            tu_cs_emit_qw(cs, indirect_iova + i * sizeof(uint32_t));
-         }
-
-         /* Fill out IR3_DP_CS_SUBGROUP_SIZE and IR3_DP_SUBGROUP_ID_SHIFT for
-          * indirect dispatch.
-          */
-         if (info->indirect && num_consts > IR3_DP_CS(base_group_x)) {
-            uint32_t indirect_driver_params[8] = {
-               0, 0, 0, subgroup_size,
-               0, 0, 0, subgroup_shift,
-            };
-            bool emit_local = num_consts > IR3_DP_CS(local_group_size_x);
-            uint32_t emit_size = emit_local ? 8 : 4;
-
-            tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + emit_size);
-            tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, 0) + 4 * sizeof(uint32_t));
-            for (uint32_t i = 0; i < emit_size; i++) {
-               tu_cs_emit(cs, indirect_driver_params[i]);
+            for (uint32_t i = 0; i < 3; i++) {
+               tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+               tu_cs_emit(cs, 0);
+               tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, i));
+               tu_cs_emit_qw(cs, indirect_iova + i * sizeof(uint32_t));
             }
-         }
 
-         tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
-         tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
-         tu_cs_emit_wfi(cs);
+            /* Fill out IR3_DP_CS_SUBGROUP_SIZE and IR3_DP_SUBGROUP_ID_SHIFT
+             * for indirect dispatch.
+             */
+            if (info->indirect && num_consts > IR3_DP_CS(base_group_x)) {
+               uint32_t indirect_driver_params[8] = {
+                  0, 0, 0, subgroup_size,
+                  0, 0, 0, subgroup_shift,
+               };
+               bool emit_local = num_consts > IR3_DP_CS(local_group_size_x);
+               uint32_t emit_size = emit_local ? 8 : 4;
+
+               tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + emit_size);
+               tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, 0) + 4 * sizeof(uint32_t));
+               for (uint32_t i = 0; i < emit_size; i++) {
+                  tu_cs_emit(cs, indirect_driver_params[i]);
+               }
+            }
+
+            tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+            tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+            tu_cs_emit_wfi(cs);
+         }
+         if (phase == TU_DP_COPY)
+            return;
 
          iova = global_iova(cmd, cs_indirect_xyz[0]);
       }
@@ -9719,6 +9738,8 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
 
       uint32_t num_consts = MIN2(const_state->num_driver_params,
                                  (variant->constlen - offset) * 4);
+      if (phase == TU_DP_COPY && !(info->indirect & 0xf))
+         return;
 
       if (!info->indirect) {
          struct ir3_driver_params_cs driver_params =
@@ -9749,19 +9770,23 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
           * However, CP_LOAD_STATE.EXT_SRC_ADDR needs 16 byte alignment.
           */
 
-         /* Wait for any previous uses to finish. */
-         tu_cs_emit_wfi(cs);
+         if (phase != TU_DP_LOAD) {
+            /* Wait for any previous uses to finish. */
+            tu_cs_emit_wfi(cs);
 
-         for (uint32_t i = 0; i < 3; i++) {
-            tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
-            tu_cs_emit(cs, 0);
-            tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, i));
-            tu_cs_emit_qw(cs, info->indirect + i * 4);
+            for (uint32_t i = 0; i < 3; i++) {
+               tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+               tu_cs_emit(cs, 0);
+               tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, i));
+               tu_cs_emit_qw(cs, info->indirect + i * 4);
+            }
+
+            tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+            tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+            tu_cs_emit_wfi(cs);
          }
-
-         tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
-         tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
-         tu_cs_emit_wfi(cs);
+         if (phase == TU_DP_COPY)
+            return;
 
          tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 3);
          tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(offset) |
@@ -9821,22 +9846,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    if (cmd->device->dbg_renderpass_stomp_cs) {
       tu_cs_emit_state_ib(&cmd->cs, shader->state);
       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
-   } else if (CHIP >= A8XX && !TU_DEBUG(NO_CS_REEMIT) &&
-              cs->cur != cmd->state.compute_state_end) {
-      /* shadPS4 workaround (Odin3 / Adreno 830, Kingdom Hearts III loading
-       * hang): the compute pipeline registers do not survive the work
-       * recorded between a compute bind and a later dispatch. KGSL
-       * snapshots of the hang show SP_CS_CONFIG, SP_CS_INSTR_SIZE,
-       * SP_CS_CNTL_0/1 and SP_CS_CONST_CONFIG as zero, with SP_CS_BASE
-       * kept, for a dispatch recorded after render passes and blits
-       * without a rebind, and the dispatch never completes. The gen8.0
-       * context switch probably does not keep them. Re-emit the shader and
-       * its load state when anything was recorded since they were last
-       * emitted; back-to-back dispatches skip this.
-       */
-      tu_cs_emit_state_ib(cs, shader->state);
-      cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
    }
+
+   /* shadPS4 workaround for A8XX, see below. */
+   const bool reemit_cs_state = CHIP >= A8XX && !TU_DEBUG(NO_CS_REEMIT);
 
    /* There appears to be a HW bug where in some rare circumstances it appears
     * to accidentally use the FS instrlen instead of the CS instrlen, which
@@ -9865,10 +9878,50 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     */
    tu_emit_cache_flush<CHIP>(cmd);
 
+   if (reemit_cs_state) {
+      /* shadPS4 workaround (A8XX; Kingdom Hearts III loading hang on the
+       * AYN Odin3, Adreno 830 gen8.0, SQE 0x01500081; the same zeroed
+       * registers show up in Swan, gen8.2, SQE 0x01510103, snapshots).
+       *
+       * When KGSL switches the ringbuffer out in the middle of an IB (L1
+       * preemption) and back, the SP compute program registers are not
+       * restored: SP_CS_CONFIG, SP_CS_INSTR_SIZE, SP_CS_CNTL_0/1,
+       * SP_CS_CONST_CONFIG, SP_CS_PVT_MEM_SIZE, SP_CS_WIE_CNTL_0 and
+       * SP_CS_WGE_CNTL read back as zero while SP_CS_BASE keeps its value,
+       * and the next CP_EXEC_CS never completes. In the hang snapshots the
+       * BR context record holds a bin-boundary switch-out right after the
+       * RM6_BIN_RENDER_END of a GMEM pass recorded between the compute bind
+       * and the dispatch. Forcing KGSL preemption/preempt_level=0 avoids
+       * the hang; preemption/skipsaverestore=0 does not, so the CP
+       * save/restore does not cover these registers either.
+       *
+       * In the snapshots switch-outs happen at bin boundaries and at sync
+       * points (CP_WAIT_FOR_IDLE, CP_WAIT_FOR_ME, event writes). Re-emit
+       * the shader state before every dispatch after the last such point:
+       * after the cache flush and after the indirect driver param copy,
+       * which waits for idle.
+       * The shader state invalidates the compute constant and UAV state,
+       * so constants, driver params and descriptors are loaded after it.
+       * It is skipped only when nothing at all was recorded since the
+       * state was last emitted, e.g. a bind directly followed by this
+       * dispatch. The unaligned indirect path (BVH builds) still waits
+       * between here and CP_RUN_OPENCL; shadPS4 does not use it.
+       *
+       * TU_DEBUG=nocsreemit turns this off.
+       */
+      tu_emit_compute_driver_params<CHIP>(cmd, cs, info, TU_DP_COPY);
+      if (cs->cur != cmd->state.compute_state_end) {
+         tu_cs_emit_state_ib(cs, shader->state);
+         cmd->state.compute_state_end = cs->cur;
+         cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+      }
+   }
+
    /* note: no reason to have this in a separate IB */
    tu_cs_emit_state_ib(cs, tu_emit_consts<CHIP>(cmd, true));
 
-   tu_emit_compute_driver_params<CHIP>(cmd, cs, info);
+   tu_emit_compute_driver_params<CHIP>(cmd, cs, info,
+                                       reemit_cs_state ? TU_DP_LOAD : TU_DP_ALL);
 
    if (cmd->state.dirty & TU_CMD_DIRTY_COMPUTE_DESC_SETS) {
       tu6_emit_descriptor_sets<CHIP>(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -10079,7 +10132,6 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
    }
 
-   cmd->state.compute_state_end = cs->cur;
    cmd->state.total_dispatches++;
 }
 

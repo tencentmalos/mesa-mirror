@@ -3226,8 +3226,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* shadPS4 workaround, see tu_dispatch(). */
    if (physical_device->info->chip >= A8XX && !TU_DEBUG(NO_CS_REEMIT))
-      mesa_logi("A8XX: compute state is re-emitted after intervening "
-                "commands (shadPS4 workaround, TU_DEBUG=nocsreemit "
+      mesa_logi("A8XX: compute state is re-emitted right before every "
+                "dispatch (shadPS4 workaround, TU_DEBUG=nocsreemit "
                 "disables it)");
 
    /* Initialize a condition variable for timeline semaphore */
