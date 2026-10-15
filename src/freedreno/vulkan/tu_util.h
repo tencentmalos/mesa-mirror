@@ -83,6 +83,7 @@ enum tu_debug_flags : uint64_t
    TU_DEBUG_NO_CS_REEMIT             = BITFIELD64_BIT(44),
    TU_DEBUG_CMD_AUDIT                = BITFIELD64_BIT(45),
    TU_DEBUG_CS_BO_CACHE              = BITFIELD64_BIT(46),
+   TU_DEBUG_IB2_PAGE_SPLIT           = BITFIELD64_BIT(47),
 };
 
 struct tu_env {

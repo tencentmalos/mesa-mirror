@@ -65,6 +65,7 @@ static const struct debug_control tu_debug_options[] = {
    { "nocsreemit", TU_DEBUG_NO_CS_REEMIT },
    { "cmdaudit", TU_DEBUG_CMD_AUDIT },
    { "csbocache", TU_DEBUG_CS_BO_CACHE },
+   { "ib2pagesplit", TU_DEBUG_IB2_PAGE_SPLIT },
    { NULL, 0 }
 };
 

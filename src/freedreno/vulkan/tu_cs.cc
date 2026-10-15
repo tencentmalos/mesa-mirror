@@ -448,6 +448,17 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
    assert(size);
 
+   /* TU_DEBUG=ib2pagesplit: keep a sub stream that fits in a page (draw
+    * states read by the DDE) within one page, see tu_cs_page_split().
+    */
+   if (unlikely(cs->page_split) && cs->cur && count * size < 1024) {
+      const uint32_t left = 1024 - ((tu_cs_get_cur_iova(cs) & 4095) / 4);
+      if (left < count * size && tu_cs_get_space(cs) >= left + count * size) {
+         cs->cur += left;
+         cs->start = cs->cur;
+      }
+   }
+
    VkResult result;
    if (tu_cs_get_space(cs) < count * size) {
       /* When we have to allocate a new BO, assume that the alignment of the
@@ -659,6 +670,77 @@ tu_cs_align_draw_state(struct tu_cs *cs, uint16_t cnt)
    tu_cs_emit(cs, pm4_pkt7_hdr(CP_NOP, remaining - 1));
    for (uint32_t i = 1; i < remaining; i++)
       tu_cs_emit(cs, 0);
+}
+
+/**
+ * TU_DEBUG=ib2pagesplit workaround for A8XX: the CP has been seen to fetch
+ * zeros instead of the second page of an IB2 that crosses a 4 KiB boundary,
+ * although the memory holds the right commands and no SMMU fault is raised.
+ * When the next reservation would cross the boundary, pad the current page
+ * with a NOP and start a new IB entry on the next page, so that every IB of
+ * the stream lies within one page. Conditional execution regions are closed
+ * at the split and reopened after it, like on a BO switch. Reservations of a
+ * page or more cannot be kept within a page and are left alone.
+ */
+void
+tu_cs_page_split(struct tu_cs *cs, uint32_t reserved_size)
+{
+   assert(cs->mode == TU_CS_MODE_GROW);
+   if (cs->status != VK_SUCCESS || !cs->cur)
+      return;
+
+   const uint32_t cond_size = 3 * cs->cond_stack_depth;
+   if (reserved_size + cond_size >= 1024)
+      return;
+
+   const uint32_t left = 1024 - ((tu_cs_get_cur_iova(cs) & 4095) / 4);
+   if (reserved_size <= left)
+      return;
+
+   /* Not enough room in this BO: tu_cs_reserve_space() switches to a new,
+    * page-aligned BO anyway.
+    */
+   if (tu_cs_get_space(cs) < left + reserved_size + cond_size)
+      return;
+
+   if (tu_cs_is_empty(cs)) {
+      /* Nothing to end yet: start the next entry on the next page. */
+      cs->cur += left;
+      cs->start = cs->cur;
+      cs->reserved_end = cs->cur;
+      return;
+   }
+
+   if (tu_cs_reserve_entry(cs) != VK_SUCCESS) {
+      tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+      /* Subtract one here to account for the DWORD field itself. */
+      *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
+   }
+
+   cs->reserved_end = cs->cur + left;
+   tu_cs_emit(cs, pm4_pkt7_hdr(CP_NOP, left - 1));
+   for (uint32_t i = 1; i < left; i++)
+      tu_cs_emit(cs, 0);
+   tu_cs_add_entry(cs);
+
+   static std::atomic<uint32_t> logged{0};
+   if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+      mesa_logi("IB2 page split (%s): next IB starts at 0x%" PRIx64 ", padded %u dwords",
+                cs->name, tu_cs_get_cur_iova(cs), left);
+
+   cs->reserved_end = cs->cur + cond_size;
+   for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+      tu_cs_emit(cs, pm4_pkt7_hdr(CP_COND_REG_EXEC, 2));
+      tu_cs_emit(cs, cs->cond_flags[i]);
+      cs->cond_dwords[i] = cs->cur;
+      /* Emit dummy DWORD field here */
+      tu_cs_emit(cs, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(0));
+   }
+   cs->reserved_end = cs->cur;
 }
 
 /**
