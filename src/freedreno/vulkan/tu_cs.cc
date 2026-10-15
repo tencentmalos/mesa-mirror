@@ -271,13 +271,24 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
       return VK_SUCCESS;
    }
 
+   /* TU_DEBUG=csalign64k: give command stream BOs a 64 KiB aligned GPU VA,
+    * so that no last-level page table cache line (8 PTEs, 32 KiB of VA) is
+    * shared with another BO. On A8XX the CP has been seen to fetch zeros for
+    * the second page of a command BO whose first PTEs share a line with a
+    * BO that was freed earlier.
+    */
    VkResult result =
-      tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
-                     (enum tu_bo_alloc_flags)(COND(!cs->writeable,
-                                                   TU_BO_ALLOC_GPU_READ_ONLY) |
-                                              TU_BO_ALLOC_ALLOW_DUMP |
-                                              tu_bo_ib_flags(cs->device)),
-                     cs->name);
+      tu_bo_init_new_explicit_iova(
+         cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+         TU_DEBUG(CS_ALIGN_64K) ? 64 * 1024 : 0, 0,
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+         (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+                                       TU_BO_ALLOC_GPU_READ_ONLY) |
+                                  TU_BO_ALLOC_ALLOW_DUMP |
+                                  tu_bo_ib_flags(cs->device)),
+         NULL, cs->name);
    if (result != VK_SUCCESS) {
       return result;
    }
