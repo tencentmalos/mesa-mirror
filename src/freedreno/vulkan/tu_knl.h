@@ -78,6 +78,12 @@ struct tu_bo {
     * inode to provide a consistent ID across imports.
     */
    uint64_t unique_id;
+
+   /* TU_DEBUG=cmdaudit: KGSL context and timestamp of the last submission
+    * that referenced this BO.
+    */
+   uint32_t audit_ctx;
+   uint32_t audit_ts;
 };
 
 enum tu_sparse_vma_flags {

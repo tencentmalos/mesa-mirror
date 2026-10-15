@@ -23,6 +23,7 @@
 #include "util/u_vector.h"
 #include "vk_util.h"
 
+#include "tu_cmd_audit.h"
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_device.h"
@@ -106,6 +107,7 @@ kgsl_submitqueue_close(struct tu_device *dev, struct tu_queue *queue)
 }
 
 static void kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo);
+static inline bool timestamp_cmp(uint32_t a, uint32_t b);
 
 static VkResult
 bo_init_new_dmaheap(struct tu_device *dev, struct tu_bo **out_bo, uint64_t size,
@@ -425,6 +427,9 @@ kgsl_bo_init(struct tu_device *dev,
 
    tu_dump_bo_init(dev, bo);
 
+   if (TU_DEBUG(CMD_AUDIT))
+      tu_cmd_audit_bo_event(bo, true, name, 0, false);
+
    VkResult result = VK_SUCCESS;
 
    if (lazy_vma) {
@@ -563,6 +568,26 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
 
    tu_debug_bos_del(dev, bo);
    tu_dump_bo_del(dev, bo);
+
+   if (TU_DEBUG(CMD_AUDIT)) {
+      /* Report frees of BOs whose last referencing submission has not
+       * retired yet: the GPU may still read them.
+       */
+      uint32_t retired = 0;
+      bool pending = false;
+      const uint32_t ctx = p_atomic_read(&bo->audit_ctx);
+      if (ctx) {
+         struct kgsl_cmdstream_readtimestamp_ctxtid read = {
+            .context_id = ctx,
+            .type = KGSL_TIMESTAMP_RETIRED,
+         };
+         if (!safe_ioctl(dev->fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &read)) {
+            retired = read.timestamp;
+            pending = !timestamp_cmp(retired, p_atomic_read(&bo->audit_ts));
+         }
+      }
+      tu_cmd_audit_bo_event(bo, false, NULL, retired, pending);
+   }
 
    if (bo->map) {
       TU_RMV(bo_unmap, dev, bo);
@@ -920,6 +945,8 @@ kgsl_timestamp_error(
    /* - EPROTO - Device faulted since the last check;
     * - ENOENT - Context has been detached.
     */
+   if ((error == EDEADLK || error == EPROTO || error == ENOENT) && TU_DEBUG(CMD_AUDIT))
+      tu_cmd_audit_dump("timestamp error");
    if (error == EDEADLK || error == EPROTO || error == ENOENT)
       return vk_device_set_lost(&device->vk, "KGSL timestamp %s failed: context %u, timestamp %u, errno %d (%s)",
                                 operation, context_id, timestamp, error, strerror(error));
@@ -1757,6 +1784,8 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
       profiling_submitted = profiling_buffer && (ret == 0 || error == EPROTO);
       if (ret) {
          kgsl_syncobj_destroy(&wait_sync);
+         if (TU_DEBUG(CMD_AUDIT))
+            tu_cmd_audit_dump("submit failed");
          result = vk_device_set_lost(&queue->device->vk, "submit failed: %s\n", strerror(error));
          goto fail_submit;
       }
@@ -1919,6 +1948,8 @@ kgsl_device_check_status(struct tu_device *device)
 
          if (value != KGSL_CTX_STAT_NO_ERROR &&
             value != KGSL_CTX_STAT_INNOCENT_CONTEXT_RESET_EXT) {
+            if (TU_DEBUG(CMD_AUDIT))
+               tu_cmd_audit_dump("reset status");
             return vk_device_set_lost(&device->vk, "GPU faulted or hung");
          }
       }
