@@ -256,6 +256,10 @@ tu_cs_init_suballoc(struct tu_cs *cs, struct tu_device *device,
 void
 tu_cs_finish(struct tu_cs *cs);
 
+/* Frees the command-stream BOs kept by TU_DEBUG=csbocache for this device. */
+void
+tu_cs_bo_cache_release_device(struct tu_device *device);
+
 void
 tu_cs_begin(struct tu_cs *cs);
 

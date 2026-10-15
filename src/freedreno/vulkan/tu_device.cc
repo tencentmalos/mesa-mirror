@@ -3464,6 +3464,9 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
          vk_free(&device->vk.alloc, device->queues[i]);
    }
 
+   /* Every command stream is finished by now. */
+   tu_cs_bo_cache_release_device(device);
+
    tu_drm_device_finish(device);
 
    if (device->physical_device->has_set_iova)

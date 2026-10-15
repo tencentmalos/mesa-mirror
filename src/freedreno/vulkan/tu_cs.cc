@@ -9,7 +9,100 @@
 #include "tu_rmv.h"
 #include "tu_suballoc.h"
 
+#include "util/simple_mtx.h"
+
 uint32_t tu_cs_fail_sink[TU_CS_FAIL_SINK_SIZE];
+
+/* TU_DEBUG=csbocache: BOs released by tu_cs_reset/tu_cs_finish are kept and
+ * handed to the next tu_cs_add_bo of the same size and kind, instead of being
+ * freed and allocated again. A command stream then keeps reusing the same
+ * GPU addresses and pages, and no IOMMU unmap (with its TLB invalidation) is
+ * issued for command memory while the GPU runs.
+ */
+#define TU_CS_BO_CACHE_SLOTS 256
+#define TU_CS_BO_CACHE_BYTES (96ull << 20)
+
+struct tu_cs_bo_cache_slot {
+   struct tu_device *device;
+   struct tu_bo *bo;
+   uint64_t seq;
+   bool read_only;
+};
+
+static simple_mtx_t tu_cs_bo_cache_mtx = SIMPLE_MTX_INITIALIZER;
+static struct tu_cs_bo_cache_slot tu_cs_bo_cache[TU_CS_BO_CACHE_SLOTS];
+static uint64_t tu_cs_bo_cache_bytes;
+static uint64_t tu_cs_bo_cache_seq;
+
+static struct tu_bo *
+tu_cs_bo_cache_get(struct tu_device *device, uint64_t bytes, bool read_only)
+{
+   struct tu_bo *bo = NULL;
+   int best = -1;
+
+   simple_mtx_lock(&tu_cs_bo_cache_mtx);
+   for (int i = 0; i < TU_CS_BO_CACHE_SLOTS; i++) {
+      const struct tu_cs_bo_cache_slot *slot = &tu_cs_bo_cache[i];
+      if (!slot->bo || slot->device != device || slot->read_only != read_only ||
+          slot->bo->size < bytes || slot->bo->size >= bytes + 65536)
+         continue;
+      /* Oldest first: the longest time since the GPU last used it. */
+      if (best < 0 || slot->seq < tu_cs_bo_cache[best].seq)
+         best = i;
+   }
+   if (best >= 0) {
+      bo = tu_cs_bo_cache[best].bo;
+      tu_cs_bo_cache[best].bo = NULL;
+      tu_cs_bo_cache_bytes -= bo->size;
+   }
+   simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+   return bo;
+}
+
+static void
+tu_cs_release_bo(struct tu_cs *cs, struct tu_bo *bo, bool read_only)
+{
+   if (TU_DEBUG(CS_BO_CACHE) && bo->map && p_atomic_read(&bo->refcnt) == 1) {
+      simple_mtx_lock(&tu_cs_bo_cache_mtx);
+      if (tu_cs_bo_cache_bytes + bo->size <= TU_CS_BO_CACHE_BYTES) {
+         for (int i = 0; i < TU_CS_BO_CACHE_SLOTS; i++) {
+            struct tu_cs_bo_cache_slot *slot = &tu_cs_bo_cache[i];
+            if (slot->bo)
+               continue;
+            slot->device = cs->device;
+            slot->bo = bo;
+            slot->seq = tu_cs_bo_cache_seq++;
+            slot->read_only = read_only;
+            tu_cs_bo_cache_bytes += bo->size;
+            simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+            return;
+         }
+      }
+      simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+   }
+   tu_bo_finish(cs->device, bo);
+}
+
+void
+tu_cs_bo_cache_release_device(struct tu_device *device)
+{
+   struct tu_bo *bos[TU_CS_BO_CACHE_SLOTS];
+   unsigned count = 0;
+
+   simple_mtx_lock(&tu_cs_bo_cache_mtx);
+   for (int i = 0; i < TU_CS_BO_CACHE_SLOTS; i++) {
+      struct tu_cs_bo_cache_slot *slot = &tu_cs_bo_cache[i];
+      if (slot->bo && slot->device == device) {
+         bos[count++] = slot->bo;
+         tu_cs_bo_cache_bytes -= slot->bo->size;
+         slot->bo = NULL;
+      }
+   }
+   simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+
+   for (unsigned i = 0; i < count; i++)
+      tu_bo_finish(device, bos[i]);
+}
 
 /* There is a limit to IB size supported by HW,
  * which appears to be 0x0fffff.
@@ -84,12 +177,12 @@ tu_cs_finish(struct tu_cs *cs)
 {
    for (uint32_t i = 0; i < cs->read_only.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+      tu_cs_release_bo(cs, cs->read_only.bos[i], true);
    }
 
    for (uint32_t i = 0; i < cs->read_write.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+      tu_cs_release_bo(cs, cs->read_write.bos[i], false);
    }
 
    if (cs->refcount_bo)
@@ -168,7 +261,15 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
       bos->bos = new_bos;
    }
 
-   struct tu_bo *new_bo;
+   struct tu_bo *new_bo = TU_DEBUG(CS_BO_CACHE) ?
+      tu_cs_bo_cache_get(cs->device, size * sizeof(uint32_t), !cs->writeable) : NULL;
+   if (new_bo) {
+      TU_RMV(cmd_buffer_bo_create, cs->device, new_bo);
+      bos->bos[bos->bo_count++] = new_bo;
+      cs->start = cs->cur = cs->reserved_end = (uint32_t *) new_bo->map;
+      cs->end = cs->start + size;
+      return VK_SUCCESS;
+   }
 
    VkResult result =
       tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
@@ -578,12 +679,12 @@ tu_cs_reset(struct tu_cs *cs)
 
    for (uint32_t i = 0; i + 1 < cs->read_only.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+      tu_cs_release_bo(cs, cs->read_only.bos[i], true);
    }
 
    for (uint32_t i = 0; i + 1 < cs->read_write.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+      tu_cs_release_bo(cs, cs->read_write.bos[i], false);
    }
 
    assert(!cs->writeable);
