@@ -769,10 +769,25 @@ tu_cmd_audit_dump(const char *reason)
    audit_dumped = true;
    const uint64_t now = os_time_get_nano();
 
-   FILE *f = NULL;
+   /* TU_CMD_AUDIT_FILE, else the app's cache directory (Android app processes
+    * are named after their package).
+    */
+   char base[256] = "";
    if (const char *path = getenv("TU_CMD_AUDIT_FILE")) {
+      snprintf(base, sizeof(base), "%s", path);
+   } else if (FILE *cmdline = fopen("/proc/self/cmdline", "r")) {
+      char pkg[128] = "";
+      if (fgets(pkg, sizeof(pkg), cmdline) && pkg[0] && !strchr(pkg, '/')) {
+         if (char *colon = strchr(pkg, ':'))
+            *colon = 0; /* "package:process" */
+         snprintf(base, sizeof(base), "/data/data/%s/cache/cmdaudit", pkg);
+      }
+      fclose(cmdline);
+   }
+   FILE *f = NULL;
+   if (base[0]) {
       char name[512];
-      snprintf(name, sizeof(name), "%s.%d.txt", path, (int) getpid());
+      snprintf(name, sizeof(name), "%s.%d.txt", base, (int) getpid());
       f = fopen(name, "w");
       if (!f)
          mesa_loge("cmdaudit: cannot open %s: %s", name, strerror(errno));
