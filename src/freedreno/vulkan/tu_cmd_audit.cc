@@ -66,10 +66,20 @@ struct audit_bo_event {
  * CP_SET_DRAW_STATE groups and IB2 calls that point outside the command
  * buffer's own BOs (pipelines, suballocators) can be resolved.
  */
+struct audit_page {
+   uint64_t first_seq;
+   uint64_t last_seq;
+   uint32_t refs;     /* submissions whose IB1/IB2/draw states touched the page */
+   uint32_t last_ts;
+};
+
 struct audit_live {
    uint64_t iova;
    uint64_t size;
    const struct tu_bo *bo;
+   struct audit_page *pages; /* allocated when first referenced */
+   uint64_t alloc_seq;
+   uint64_t alloc_ns;
    uint32_t gem;
    char name[20];
 };
@@ -96,6 +106,12 @@ struct audit_item {
    uint32_t parent;    /* IB2 call index + 1 for groups found in an IB2, 0 for IB1 */
    uint32_t copy_dw;   /* offset of the submit-time copy in the slot arena, ~0 if none */
    int32_t first_bad;
+   /* History of the first and last page of the item before this submission. */
+   uint32_t page[2];
+   uint32_t page_refs[2];
+   uint64_t page_last_seq[2];
+   uint64_t bo_alloc_seq;
+   uint64_t bo_alloc_ns;
    uint8_t kind;
    uint8_t state;
    char name[20];
@@ -264,13 +280,13 @@ audit_live_floor(uint64_t iova)
    return best;
 }
 
-static const struct audit_live *
+static struct audit_live *
 audit_live_find(uint64_t iova, uint64_t bytes)
 {
    const int32_t i = audit_live_floor(iova);
    if (i < 0)
       return NULL;
-   const struct audit_live *l = &audit_lives[i];
+   struct audit_live *l = &audit_lives[i];
    return iova + bytes <= l->iova + l->size ? l : NULL;
 }
 
@@ -296,6 +312,9 @@ audit_live_insert(const struct tu_bo *bo, const char *name)
    l->iova = bo->iova;
    l->size = bo->size;
    l->bo = bo;
+   l->pages = NULL;
+   l->alloc_seq = audit_submit_seq;
+   l->alloc_ns = os_time_get_nano();
    l->gem = bo->gem_handle;
    snprintf(l->name, sizeof(l->name), "%s", name ? name : "");
    audit_live_count++;
@@ -319,6 +338,7 @@ audit_live_remove(const struct tu_bo *bo)
       if (i < 0)
          return;
    }
+   free(audit_lives[i].pages);
    memmove(&audit_lives[i], &audit_lives[i + 1],
            (audit_live_count - i - 1) * sizeof(*audit_lives));
    audit_live_count--;
@@ -342,13 +362,50 @@ audit_dedupe_first(uint64_t key)
    return true; /* table crowded: record a duplicate rather than miss one */
 }
 
+/* Records that submission seq touched [iova, iova + bytes) of l and returns
+ * the history of the first and last page as it was before.
+ */
+static void
+audit_live_touch(struct audit_live *l, uint64_t iova, uint64_t bytes, uint64_t seq,
+                 uint32_t ts, struct audit_item *it)
+{
+   const uint32_t npages = (uint32_t) ((l->size + 4095) / 4096);
+   if (!l->pages) {
+      l->pages = (struct audit_page *) calloc(npages, sizeof(*l->pages));
+      if (!l->pages)
+         return;
+   }
+   const uint32_t first = (uint32_t) ((iova - l->iova) / 4096);
+   const uint32_t last = MIN2((uint32_t) ((iova + MAX2(bytes, 4) - 1 - l->iova) / 4096), npages - 1);
+   if (it) {
+      it->page[0] = first;
+      it->page[1] = last;
+      it->page_refs[0] = l->pages[first].refs;
+      it->page_last_seq[0] = l->pages[first].last_seq;
+      it->page_refs[1] = l->pages[last].refs;
+      it->page_last_seq[1] = l->pages[last].last_seq;
+      it->bo_alloc_seq = l->alloc_seq;
+      it->bo_alloc_ns = l->alloc_ns;
+   }
+   for (uint32_t p = first; p <= last; p++) {
+      struct audit_page *pg = &l->pages[p];
+      if (pg->refs && pg->last_seq == seq)
+         continue;
+      if (!pg->refs)
+         pg->first_seq = seq;
+      pg->refs++;
+      pg->last_seq = seq;
+      pg->last_ts = ts;
+   }
+}
+
 /* Records one IB1 entry, IB2 call or draw-state group of the current
  * submission and copies its dwords. Returns the copy (or the live mapping
  * when the arena is full), NULL if the content cannot be read.
  */
 static const uint32_t *
-audit_record_item(struct audit_content *c, uint8_t kind, uint64_t iova, uint32_t size_dw,
-                  uint32_t d0, uint32_t parent, const struct tu_bo *bo,
+audit_record_item(struct audit_content *c, uint32_t ts, uint8_t kind, uint64_t iova,
+                  uint32_t size_dw, uint32_t d0, uint32_t parent, const struct tu_bo *bo,
                   struct audit_item **out)
 {
    *out = NULL;
@@ -367,7 +424,9 @@ audit_record_item(struct audit_content *c, uint8_t kind, uint64_t iova, uint32_t
    it->copy_dw = ~0u;
    *out = it;
 
-   const struct audit_live *l = audit_live_find(iova, (uint64_t) size_dw * 4);
+   struct audit_live *l = audit_live_find(iova, (uint64_t) size_dw * 4);
+   if (l)
+      audit_live_touch(l, iova, (uint64_t) size_dw * 4, c->seq, ts, it);
    if (bo) {
       it->bo = bo;
       it->bo_iova = bo->iova;
@@ -442,7 +501,7 @@ tu_cmd_audit_submit(struct tu_queue *queue,
             return;
          }
          struct audit_item *it;
-         const uint32_t *dw = audit_record_item(c, ITEM_SDS, addr, count, d0, parent, NULL, &it);
+         const uint32_t *dw = audit_record_item(c, ts, ITEM_SDS, addr, count, d0, parent, NULL, &it);
          if (!dw || !it)
             return;
          it->first_bad = audit_check(dw, count);
@@ -490,7 +549,7 @@ tu_cmd_audit_submit(struct tu_queue *queue,
          const uint64_t ib1_iova = entry->bo->iova + entry->offset;
          const uint32_t ib1_dw = entry->size / 4;
          struct audit_item *ib1_item;
-         const uint32_t *ib1 = audit_record_item(c, ITEM_IB1, ib1_iova, ib1_dw, 0, 0,
+         const uint32_t *ib1 = audit_record_item(c, ts, ITEM_IB1, ib1_iova, ib1_dw, 0, 0,
                                                  entry->bo, &ib1_item);
          if (!ib1)
             ib1 = (const uint32_t *) ((const char *) entry->bo->map + entry->offset);
@@ -527,7 +586,7 @@ tu_cmd_audit_submit(struct tu_queue *queue,
              */
             if (audit_dedupe_first(iova | ((uint64_t) size_dw << 44) | (1ull << 63))) {
                struct audit_item *ib2_item;
-               const uint32_t *copy = audit_record_item(c, ITEM_IB2, iova, size_dw, 0, 0, bo, &ib2_item);
+               const uint32_t *copy = audit_record_item(c, ts, ITEM_IB2, iova, size_dw, 0, 0, bo, &ib2_item);
                if (copy)
                   ib2 = copy;
                r->first_bad = audit_walk(ib2, size_dw, [](uint64_t, uint32_t) {},
@@ -668,6 +727,11 @@ audit_dump_content(const struct audit_content *c, const struct audit_submit *s, 
                  it->first_bad, now_state);
          if (diff >= 0)
             fprintf(f, " first_diff=%d (0x%08x -> 0x%08x)", diff, copy[diff], now[diff]);
+         if (it->state != STATE_UNRESOLVED)
+            fprintf(f, " bo_alloc_seq=%" PRIu64 " page%u_prev_refs=%u last_seq=%" PRIu64
+                    " page%u_prev_refs=%u last_seq=%" PRIu64,
+                    it->bo_alloc_seq, it->page[0], it->page_refs[0], it->page_last_seq[0],
+                    it->page[1], it->page_refs[1], it->page_last_seq[1]);
          fprintf(f, "\n");
          if (copy && (detail || interesting))
             audit_hex(f, "S", copy, it->size_dw);
