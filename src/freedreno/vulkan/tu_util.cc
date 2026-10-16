@@ -67,6 +67,7 @@ static const struct debug_control tu_debug_options[] = {
    { "csbocache", TU_DEBUG_CS_BO_CACHE },
    { "ib2pagesplit", TU_DEBUG_IB2_PAGE_SPLIT },
    { "csalign64k", TU_DEBUG_CS_ALIGN_64K },
+   { "lrznoreuse", TU_DEBUG_LRZ_NO_REUSE },
    { NULL, 0 }
 };
 

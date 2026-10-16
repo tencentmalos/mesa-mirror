@@ -85,6 +85,7 @@ enum tu_debug_flags : uint64_t
    TU_DEBUG_CS_BO_CACHE              = BITFIELD64_BIT(46),
    TU_DEBUG_IB2_PAGE_SPLIT           = BITFIELD64_BIT(47),
    TU_DEBUG_CS_ALIGN_64K             = BITFIELD64_BIT(48),
+   TU_DEBUG_LRZ_NO_REUSE             = BITFIELD64_BIT(49),
 };
 
 struct tu_env {
