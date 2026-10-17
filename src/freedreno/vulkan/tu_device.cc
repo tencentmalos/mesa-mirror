@@ -3081,6 +3081,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_GPU_READ_ONLY |
                                 TU_BO_ALLOC_ALLOW_DUMP |
                                 TU_BO_ALLOC_INTERNAL_RESOURCE |
+                                TU_BO_ALLOC_IB_SUBALLOC |
                                 tu_bo_ib_flags(device)),
       "pipeline_suballoc");
    if (is_kgsl(physical_device->instance)) {

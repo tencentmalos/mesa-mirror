@@ -364,6 +364,11 @@ struct tu_device
    struct tu_suballocator kgsl_profiling_suballoc;
    mtx_t kgsl_profiling_mutex;
 
+   /* Retired command-stream BO cache for TU_DEBUG=cs_recycle. Only created,
+    * and only used, by the kgsl backend.
+    */
+   struct kgsl_cs_cache *cs_cache;
+
    /* VkEvent BO suballocator.  Synchronized by event_mutex.
     */
    struct tu_suballocator event_suballoc;

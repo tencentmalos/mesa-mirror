@@ -30,6 +30,9 @@ enum tu_bo_alloc_flags {
    TU_BO_ALLOC_SHAREABLE = 1 << 5,
    TU_BO_ALLOC_IMPLICIT_SYNC = 1 << 6,
    TU_BO_ALLOC_NO_32B_ROLLOVER = 1 << 7,
+   /* Marks pipeline_suballoc blocks, which TU_DEBUG=cs_recycle does not keep
+    * (mesa#16460). */
+   TU_BO_ALLOC_IB_SUBALLOC = 1 << 8,
 };
 
 enum tu_mem_sync_op {
@@ -57,6 +60,13 @@ struct tu_bo {
     * export file descriptor.
     */
    int shared_fd;
+
+   /* What this BO was requested from kgsl with: TU_DEBUG=cs_recycle only
+    * hands a retired BO back to an identical request. cs_cache_size is zero
+    * for BOs that the cache must not keep.
+    */
+   uint32_t cs_cache_flags;
+   uint64_t cs_cache_size;
 #endif
 
    bool implicit_sync : 1;

@@ -301,6 +301,192 @@ kgsl_align_flag(uint64_t align)
    return 0;
 }
 
+/* TU_DEBUG=cs_recycle: cache of retired command-stream BOs (port of the
+ * mesa!44888 draft for mesa#16460).
+ *
+ * On A8XX under kgsl, giving command-stream storage back to the kernel with
+ * GPUMEM_FREE_ID has been followed by `CP opcode error` / `CP DDE BR opcode
+ * error` faults with opcode 0, although every submitted packet is valid in
+ * the snapshot. The cause is not known. With this option the kernel object
+ * behind retired command-stream storage is not freed: it stays allocated and
+ * mapped in the GPU address space and only the CPU mapping is dropped. A
+ * later allocation that asks kgsl for exactly the same thing (flags and size)
+ * gets a parked BO back. Pipeline suballocator blocks are not cached.
+ *
+ * The list is kept newest first. When it grows past KGSL_CS_CACHE_MAX_BYTES
+ * the oldest entries are freed. cache->mutex is a leaf lock, never held
+ * across an ioctl.
+ */
+struct kgsl_cs_bo {
+   uint32_t handle;     /* kgsl memory id, also the bo_map index */
+   uint32_t flags;      /* flags requested from kgsl */
+   uint64_t req_size;   /* size requested from kgsl */
+   uint64_t size;       /* size of the object, tu_bo::size */
+   uint64_t iova;
+};
+
+struct kgsl_cs_cache_entry {
+   struct list_head link;
+   struct kgsl_cs_bo bo;
+};
+
+struct kgsl_cs_cache {
+   mtx_t mutex;
+   struct list_head entries;   /* newest first */
+   uint64_t bytes;
+   uint64_t hits;
+   uint64_t misses;
+   uint64_t parked;
+   uint64_t evicted;
+   uint64_t peak_bytes;
+};
+
+#define KGSL_CS_CACHE_MAX_BYTES (256ull * 1024 * 1024)
+
+/* Bounds the time spent under the lock when nothing matches. */
+#define KGSL_CS_CACHE_MAX_SCAN 256
+
+static void
+kgsl_gpumem_free_id(struct tu_device *dev, uint32_t id)
+{
+   struct kgsl_gpumem_free_id req = {
+      .id = id
+   };
+
+   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
+}
+
+static void
+kgsl_cs_cache_free_entries(struct tu_device *dev, struct list_head *list)
+{
+   list_for_each_entry_safe(struct kgsl_cs_cache_entry, entry, list, link) {
+      kgsl_gpumem_free_id(dev, entry->bo.handle);
+      free(entry);
+   }
+}
+
+static void
+kgsl_cs_cache_log_stats(struct kgsl_cs_cache *cache, const char *when)
+{
+   mesa_logi("kgsl cs cache (%s): %" PRIu64 " hits, %" PRIu64 " misses, "
+             "%" PRIu64 " parked, %" PRIu64 " evicted, peak %" PRIu64 " KiB",
+             when, p_atomic_read(&cache->hits), p_atomic_read(&cache->misses),
+             p_atomic_read(&cache->parked), p_atomic_read(&cache->evicted),
+             p_atomic_read(&cache->peak_bytes) / 1024);
+}
+
+/* Command streams only: these are the NO_32B_ROLLOVER allocations other than
+ * the pipeline suballocator's blocks.
+ */
+static bool
+kgsl_cs_cache_eligible(struct tu_device *dev, enum tu_bo_alloc_flags flags,
+                       struct tu_sparse_vma *lazy_vma)
+{
+   if (!dev->cs_cache || !(flags & TU_BO_ALLOC_NO_32B_ROLLOVER) ||
+       (flags & (TU_BO_ALLOC_REPLAYABLE | TU_BO_ALLOC_IB_SUBALLOC)) || lazy_vma)
+      return false;
+   return true;
+}
+
+/* Remove and return a parked BO identical to what a new allocation with
+ * these parameters would be.
+ */
+static bool
+kgsl_cs_cache_take(struct kgsl_cs_cache *cache, uint32_t flags,
+                   uint64_t req_size, uint64_t align, struct kgsl_cs_bo *out)
+{
+   struct kgsl_cs_cache_entry *found = NULL;
+   unsigned scanned = 0;
+
+   mtx_lock(&cache->mutex);
+   list_for_each_entry(struct kgsl_cs_cache_entry, entry, &cache->entries,
+                       link) {
+      if (++scanned > KGSL_CS_CACHE_MAX_SCAN)
+         break;
+
+      if (entry->bo.req_size == req_size && entry->bo.flags == flags &&
+          (!align || entry->bo.iova % align == 0)) {
+         list_del(&entry->link);
+         cache->bytes -= entry->bo.size;
+         found = entry;
+         break;
+      }
+   }
+   mtx_unlock(&cache->mutex);
+
+   if (!found) {
+      p_atomic_inc(&cache->misses);
+      return false;
+   }
+
+   p_atomic_inc(&cache->hits);
+   *out = found->bo;
+   free(found);
+   return true;
+}
+
+/* Park a BO. Entries that have to make room for it are moved to @evicted,
+ * the caller frees them. Returns false if the BO could not be parked, in
+ * which case freeing it is up to the caller as well.
+ */
+static bool
+kgsl_cs_cache_put(struct kgsl_cs_cache *cache, const struct kgsl_cs_bo *bo,
+                  struct list_head *evicted)
+{
+   if (bo->size > KGSL_CS_CACHE_MAX_BYTES)
+      return false;
+
+   struct kgsl_cs_cache_entry *entry =
+      (struct kgsl_cs_cache_entry *) malloc(sizeof(*entry));
+   if (!entry)
+      return false;
+
+   entry->bo = *bo;
+
+   mtx_lock(&cache->mutex);
+   list_add(&entry->link, &cache->entries);
+   cache->bytes += bo->size;
+
+   while (cache->bytes > KGSL_CS_CACHE_MAX_BYTES) {
+      struct kgsl_cs_cache_entry *oldest =
+         list_last_entry(&cache->entries, struct kgsl_cs_cache_entry, link);
+      assert(oldest != entry);
+
+      list_del(&oldest->link);
+      cache->bytes -= oldest->bo.size;
+      list_addtail(&oldest->link, evicted);
+      p_atomic_inc(&cache->evicted);
+   }
+
+   if (cache->bytes > cache->peak_bytes)
+      p_atomic_set(&cache->peak_bytes, cache->bytes);
+   mtx_unlock(&cache->mutex);
+
+   return true;
+}
+
+/* Park a BO whose last reference is gone instead of freeing it. */
+static bool
+kgsl_cs_cache_park(struct tu_device *dev, const struct kgsl_cs_bo *bo)
+{
+   struct kgsl_cs_cache *cache = dev->cs_cache;
+
+   if (!cache || !bo->req_size)
+      return false;
+
+   struct list_head evicted;
+   list_inithead(&evicted);
+
+   bool parked = kgsl_cs_cache_put(cache, bo, &evicted);
+
+   kgsl_cs_cache_free_entries(dev, &evicted);
+
+   if (parked && (p_atomic_inc_return(&cache->parked) % 4096) == 0)
+      kgsl_cs_cache_log_stats(cache, "running");
+
+   return parked;
+}
+
 static VkResult
 kgsl_bo_init(struct tu_device *dev,
              struct vk_object_base *base,
@@ -355,8 +541,21 @@ kgsl_bo_init(struct tu_device *dev,
 
    req.flags |= kgsl_align_flag(align);
 
+   /* TU_DEBUG=cs_recycle hands back retired command-stream storage, matched
+    * on exactly what is requested from kgsl here, so apart from its contents
+    * a recycled BO is the same as a new one.
+    */
+   const bool cs_cacheable = kgsl_cs_cache_eligible(dev, flags, lazy_vma);
+   const uint32_t cs_cache_flags = req.flags;
+   struct kgsl_cs_bo cs_bo;
+
    int ret;
-   if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER) {
+   if (cs_cacheable &&
+       kgsl_cs_cache_take(dev->cs_cache, cs_cache_flags, size, align, &cs_bo)) {
+      req.id = cs_bo.handle;
+      req.mmapsize = cs_bo.size;
+      req.gpuaddr = cs_bo.iova;
+   } else if (flags & TU_BO_ALLOC_NO_32B_ROLLOVER) {
       uint32_t rejected[4] = {};
       unsigned rejected_count = 0;
       int allocation_error = 0;
@@ -422,6 +621,11 @@ kgsl_bo_init(struct tu_device *dev,
       .shared_fd = -1,
       .base = base,
    };
+
+   if (cs_cacheable) {
+      bo->cs_cache_flags = cs_cache_flags;
+      bo->cs_cache_size = size;
+   }
 
    tu_dump_bo_init(dev, bo);
 
@@ -574,14 +778,23 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
 
    TU_RMV(bo_destroy, dev, bo);
 
-   struct kgsl_gpumem_free_id req = {
-      .id = bo->gem_handle
+   struct kgsl_cs_bo retired = {
+      .handle = bo->gem_handle,
+      .flags = bo->cs_cache_flags,
+      .req_size = bo->cs_cache_size,
+      .size = bo->size,
+      .iova = bo->iova,
    };
 
-   /* Tell sparse array that entry is free */
+   /* Tell sparse array that entry is free. This has to happen before the
+    * handle can be handed out again, by kgsl or by the cs cache.
+    */
    memset(bo, 0, sizeof(*bo));
 
-   safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
+   if (kgsl_cs_cache_park(dev, &retired))
+      return;
+
+   kgsl_gpumem_free_id(dev, retired.handle);
 }
 
 static VkResult
@@ -1872,13 +2085,39 @@ static VkResult
 kgsl_device_init(struct tu_device *dev)
 {
    dev->fd = dev->physical_device->local_fd;
+
+   if (TU_DEBUG_START(CS_RECYCLE)) {
+      struct kgsl_cs_cache *cache =
+         (struct kgsl_cs_cache *) calloc(1, sizeof(*cache));
+      if (!cache)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+      mtx_init(&cache->mutex, mtx_plain);
+      list_inithead(&cache->entries);
+      dev->cs_cache = cache;
+      mesa_logi("Turnip: cs_recycle keeps retired command-stream BOs "
+                "instead of GPUMEM_FREE_ID (cap %llu MiB)",
+                KGSL_CS_CACHE_MAX_BYTES / (1024 * 1024));
+   }
+
    return VK_SUCCESS;
 }
 
 static void
 kgsl_device_finish(struct tu_device *dev)
 {
-   /* No-op */
+   struct kgsl_cs_cache *cache = dev->cs_cache;
+
+   if (!cache)
+      return;
+
+   /* BOs that are still alive are freed normally from here on. */
+   dev->cs_cache = NULL;
+
+   kgsl_cs_cache_log_stats(cache, "final");
+   kgsl_cs_cache_free_entries(dev, &cache->entries);
+   mtx_destroy(&cache->mutex);
+   free(cache);
 }
 
 static int
