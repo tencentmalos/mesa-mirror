@@ -64,6 +64,7 @@ static const struct debug_control tu_debug_options[] = {
    { "lrzfc", TU_DEBUG_LRZFC },
    { "nocsreemit", TU_DEBUG_NO_CS_REEMIT },
    { "cs_recycle", TU_DEBUG_CS_RECYCLE },
+   { "cs_dsb", TU_DEBUG_CS_DSB },
    { NULL, 0 }
 };
 

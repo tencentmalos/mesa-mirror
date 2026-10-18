@@ -2100,6 +2100,10 @@ kgsl_device_init(struct tu_device *dev)
                 KGSL_CS_CACHE_MAX_BYTES / (1024 * 1024));
    }
 
+   if (TU_DEBUG(CS_DSB))
+      mesa_logi("Turnip: cs_dsb issues DSB SY after recording command "
+                "buffers and creating pipelines");
+
    return VK_SUCCESS;
 }
 

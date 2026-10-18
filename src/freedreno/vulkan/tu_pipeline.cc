@@ -4942,6 +4942,7 @@ tu_CreateGraphicsPipelines(VkDevice device,
    for (; i < count; i++)
       pPipelines[i] = VK_NULL_HANDLE;
 
+   tu_debug_publish_stores();
    return final_result;
 }
 TU_GENX(tu_CreateGraphicsPipelines);
@@ -5146,6 +5147,7 @@ tu_CreateComputePipelines(VkDevice device,
    for (; i < count; i++)
       pPipelines[i] = VK_NULL_HANDLE;
 
+   tu_debug_publish_stores();
    return final_result;
 }
 TU_GENX(tu_CreateComputePipelines);

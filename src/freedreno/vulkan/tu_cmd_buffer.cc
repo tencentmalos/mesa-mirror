@@ -5559,6 +5559,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
       }
    }
 
+   tu_debug_publish_stores();
    return vk_command_buffer_end(&cmd_buffer->vk);
 }
 TU_GENX(tu_EndCommandBuffer);

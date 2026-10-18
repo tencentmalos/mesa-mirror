@@ -82,6 +82,7 @@ enum tu_debug_flags : uint64_t
    TU_DEBUG_LRZFC                    = BITFIELD64_BIT(43),
    TU_DEBUG_NO_CS_REEMIT             = BITFIELD64_BIT(44),
    TU_DEBUG_CS_RECYCLE               = BITFIELD64_BIT(45),
+   TU_DEBUG_CS_DSB                   = BITFIELD64_BIT(46),
 };
 
 struct tu_env {
@@ -489,5 +490,23 @@ tu_dbg_log_gmem_load_store_skips(struct tu_device *device);
 
 #define offsetof_arr(s, field, idx)                                          \
    (offsetof(s, field) + sizeof_field(s, field[0]) * (idx))
+
+/* TU_DEBUG=cs_dsb: command streams and pipeline state live in write-combined
+ * BOs that one thread fills and another thread submits. Thread handoff only
+ * orders the stores for other CPUs; a DSB SY on the writing CPU completes
+ * them for the GPU too, so a submission made right afterwards cannot fetch
+ * memory the writer's write buffer has not reached yet.
+ */
+static inline void
+tu_debug_publish_stores(void)
+{
+   if (!TU_DEBUG(CS_DSB))
+      return;
+#if defined(__aarch64__)
+   __asm__ volatile("dsb sy" ::: "memory");
+#else
+   __sync_synchronize();
+#endif
+}
 
 #endif /* TU_UTIL_H */
