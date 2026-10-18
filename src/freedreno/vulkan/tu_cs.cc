@@ -20,6 +20,30 @@ tu_sanitize_ib_size(uint32_t size)
    return MIN2(size, 0x0fffff);
 }
 
+/* TU_DEBUG=cs_skip_head: command streams of 64 KiB and larger get 8 KiB of
+ * extra space at the start of their BO that is never written. Every
+ * recording then starts on the BO's third page instead of its first, which
+ * moves where draw state first lands in a fresh page.
+ */
+#define TU_CS_HEAD_SKIP_DWORDS 2048
+#define TU_CS_HEAD_SKIP_MIN_DWORDS 16384
+
+static inline uint32_t
+tu_cs_head_skip(uint32_t size)
+{
+   return TU_DEBUG(CS_SKIP_HEAD) && size >= TU_CS_HEAD_SKIP_MIN_DWORDS
+             ? TU_CS_HEAD_SKIP_DWORDS : 0;
+}
+
+static inline uint32_t
+tu_cs_bo_head_skip(const struct tu_bo *bo)
+{
+   return TU_DEBUG(CS_SKIP_HEAD) &&
+                bo->size / sizeof(uint32_t) >=
+                   TU_CS_HEAD_SKIP_MIN_DWORDS + TU_CS_HEAD_SKIP_DWORDS
+             ? TU_CS_HEAD_SKIP_DWORDS : 0;
+}
+
 /**
  * Initialize a command stream.
  */
@@ -169,9 +193,11 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
    }
 
    struct tu_bo *new_bo;
+   const uint32_t skip = tu_cs_head_skip(size);
 
    VkResult result =
-      tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+      tu_bo_init_new(cs->device, NULL, &new_bo,
+                     (size + skip) * sizeof(uint32_t),
                      (enum tu_bo_alloc_flags)(COND(!cs->writeable,
                                                    TU_BO_ALLOC_GPU_READ_ONLY) |
                                               TU_BO_ALLOC_ALLOW_DUMP |
@@ -191,7 +217,7 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
 
    bos->bos[bos->bo_count++] = new_bo;
 
-   cs->start = cs->cur = cs->reserved_end = (uint32_t *) new_bo->map;
+   cs->start = cs->cur = cs->reserved_end = (uint32_t *) new_bo->map + skip;
    cs->end = cs->start + size;
 
    return VK_SUCCESS;
@@ -592,16 +618,19 @@ tu_cs_reset(struct tu_cs *cs)
       cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
       cs->read_only.bo_count = 1;
 
-      cs->start = cs->cur = cs->reserved_end = (uint32_t *) cs->read_only.bos[0]->map;
-      cs->end = cs->start + tu_sanitize_ib_size(cs->read_only.bos[0]->size /
-                                                sizeof(uint32_t));
+      struct tu_bo *bo = cs->read_only.bos[0];
+      cs->start = cs->cur = cs->reserved_end =
+         (uint32_t *) bo->map + tu_cs_bo_head_skip(bo);
+      cs->end = (uint32_t *) bo->map +
+                tu_sanitize_ib_size(bo->size / sizeof(uint32_t));
    }
 
    if (cs->read_write.bo_count) {
       cs->read_write.bos[0] = cs->read_write.bos[cs->read_write.bo_count - 1];
       cs->read_write.bo_count = 1;
 
-      cs->read_write.start = (uint32_t *) cs->read_write.bos[0]->map;
+      cs->read_write.start = (uint32_t *) cs->read_write.bos[0]->map +
+                             tu_cs_bo_head_skip(cs->read_write.bos[0]);
    }
 
    cs->entry_count = 0;

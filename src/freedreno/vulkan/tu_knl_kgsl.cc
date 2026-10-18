@@ -2104,6 +2104,14 @@ kgsl_device_init(struct tu_device *dev)
       mesa_logi("Turnip: cs_dsb issues DSB SY after recording command "
                 "buffers and creating pipelines");
 
+   if (TU_DEBUG(CS_SKIP_HEAD))
+      mesa_logi("Turnip: cs_skip_head leaves the first 8 KiB of command-stream "
+                "BOs of 64 KiB and larger unused");
+
+   if (TU_DEBUG(DDE_TOUCH))
+      mesa_logi("Turnip: dde_touch reads every draw-state page once per "
+                "command buffer before the first draw that uses it");
+
    return VK_SUCCESS;
 }
 

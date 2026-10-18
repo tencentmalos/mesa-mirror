@@ -65,6 +65,8 @@ static const struct debug_control tu_debug_options[] = {
    { "nocsreemit", TU_DEBUG_NO_CS_REEMIT },
    { "cs_recycle", TU_DEBUG_CS_RECYCLE },
    { "cs_dsb", TU_DEBUG_CS_DSB },
+   { "cs_skip_head", TU_DEBUG_CS_SKIP_HEAD },
+   { "dde_touch", TU_DEBUG_DDE_TOUCH },
    { NULL, 0 }
 };
 

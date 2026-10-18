@@ -9,6 +9,8 @@
 
 #include "tu_cmd_buffer.h"
 
+#include "util/hash_table.h"
+
 #include "vk_common_entrypoints.h"
 #include "vk_log.h"
 #include "vk_render_pass.h"
@@ -1208,9 +1210,54 @@ tu6_apply_depth_bounds_workaround(struct tu_device *device,
                      A6XX_RB_DEPTH_CNTL_ZFUNC(FUNC_ALWAYS);
 }
 
+static void
+tu_dde_touch_note(struct tu_dde_touch *touch, uint64_t iova, uint32_t size)
+{
+   const uint64_t first = iova >> 12;
+   const uint64_t last = (iova + size * sizeof(uint32_t) - 1) >> 12;
+   for (uint64_t page = first; page <= last; page++) {
+      if (_mesa_hash_table_u64_search(touch->pages, page))
+         continue;
+      _mesa_hash_table_u64_insert(touch->pages, page, (void *) (uintptr_t) 1);
+
+      if (touch->pending_count == touch->pending_capacity) {
+         uint32_t capacity = MAX2(64, touch->pending_capacity * 2);
+         uint64_t *pending = (uint64_t *)
+            realloc(touch->pending, capacity * sizeof(*pending));
+         if (!pending)
+            return;
+         touch->pending = pending;
+         touch->pending_capacity = capacity;
+      }
+      touch->pending[touch->pending_count++] = page << 12;
+   }
+}
+
+/* A CP_WAIT_REG_MEM with mask 0 always passes, so this is only a read of the
+ * page through the CP.
+ */
+static void
+tu_dde_touch_flush(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   struct tu_dde_touch *touch = &cmd->dde_touch;
+   for (uint32_t i = 0; i < touch->pending_count; i++) {
+      tu_cs_emit_pkt7(cs, CP_WAIT_REG_MEM, 6);
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_0_FUNCTION(WRITE_EQ) |
+                     CP_WAIT_REG_MEM_0_POLL(POLL_MEMORY));
+      tu_cs_emit_qw(cs, touch->pending[i]);
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_3_REF(0));
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_4_MASK(0));
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(0));
+   }
+   touch->pending_count = 0;
+}
+
 void
 tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
 {
+   if (unlikely(cs->dde_touch) && state.size && state.iova)
+      tu_dde_touch_note(cs->dde_touch, state.iova, state.size);
+
    uint32_t enable_mask;
    switch (id) {
    case TU_DRAW_STATE_VS:
@@ -4290,6 +4337,15 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
 
+   if (TU_DEBUG(DDE_TOUCH)) {
+      cmd_buffer->dde_touch.pages = _mesa_hash_table_u64_create(NULL);
+      if (cmd_buffer->dde_touch.pages) {
+         cmd_buffer->cs.dde_touch = &cmd_buffer->dde_touch;
+         cmd_buffer->draw_cs.dde_touch = &cmd_buffer->dde_touch;
+         cmd_buffer->pre_chain.draw_cs.dde_touch = &cmd_buffer->dde_touch;
+      }
+   }
+
    for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
       cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
 
@@ -4311,6 +4367,10 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    tu_cs_finish(&cmd_buffer->sub_cs);
    tu_cs_finish(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_finish(&cmd_buffer->pre_chain.draw_epilogue_cs);
+
+   if (cmd_buffer->dde_touch.pages)
+      _mesa_hash_table_u64_destroy(cmd_buffer->dde_touch.pages);
+   free(cmd_buffer->dde_touch.pending);
 
    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS)) {
       tu_cmd_buffer_status_check_idle(cmd_buffer);
@@ -4405,6 +4465,10 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    tu_cs_reset(&cmd_buffer->sub_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_cs);
    tu_cs_reset(&cmd_buffer->pre_chain.draw_epilogue_cs);
+
+   if (cmd_buffer->dde_touch.pages)
+      _mesa_hash_table_u64_clear(cmd_buffer->dde_touch.pages);
+   cmd_buffer->dde_touch.pending_count = 0;
 
    cmd_buffer->autotune_ctx.reset(*cmd_buffer->device->autotune);
 
@@ -8684,11 +8748,11 @@ tu_flush_dynamic_input_attachments(struct tu_cmd_buffer *cmd)
 
 template <chip CHIP>
 static VkResult
-tu6_draw_common(struct tu_cmd_buffer *cmd,
-                struct tu_cs *cs,
-                bool indexed,
-                /* note: draw_count is 0 for indirect */
-                uint32_t draw_count)
+tu6_draw_common_state(struct tu_cmd_buffer *cmd,
+                      struct tu_cs *cs,
+                      bool indexed,
+                      /* note: draw_count is 0 for indirect */
+                      uint32_t draw_count)
 {
    const struct tu_program_state *program = &cmd->state.program;
    struct tu_render_pass_state *rp = &cmd->state.rp;
@@ -8984,6 +9048,21 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
    cmd->state.dirty &= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
    BITSET_ZERO(cmd->vk.dynamic_graphics_state.dirty);
    return VK_SUCCESS;
+}
+
+template <chip CHIP>
+static VkResult
+tu6_draw_common(struct tu_cmd_buffer *cmd,
+                struct tu_cs *cs,
+                bool indexed,
+                /* note: draw_count is 0 for indirect */
+                uint32_t draw_count)
+{
+   VkResult result =
+      tu6_draw_common_state<CHIP>(cmd, cs, indexed, draw_count);
+   if (unlikely(cmd->dde_touch.pending_count))
+      tu_dde_touch_flush(cmd, cs);
+   return result;
 }
 
 static uint32_t

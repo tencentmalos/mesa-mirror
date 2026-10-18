@@ -707,6 +707,19 @@ struct tu_cb_control_point {
    uint32_t original_value;
 };
 
+/* TU_DEBUG=dde_touch: the 4 KiB pages draw-state groups of this command
+ * buffer point into. A page is added to `pending` the first time a draw
+ * state references it; before the next draw the CP reads each pending page
+ * once, so the draw-state fetch of that draw is no longer the first access
+ * to the page in this command buffer.
+ */
+struct tu_dde_touch {
+   struct hash_table_u64 *pages;
+   uint64_t *pending;
+   uint32_t pending_count;
+   uint32_t pending_capacity;
+};
+
 struct tu_cmd_buffer
 {
    struct vk_command_buffer vk;
@@ -774,6 +787,8 @@ struct tu_cmd_buffer
    struct tu_cs tile_store_cs;
    struct tu_cs draw_epilogue_cs;
    struct tu_cs sub_cs;
+
+   struct tu_dde_touch dde_touch;
 
    /* If the first render pass in the command buffer is resuming, then it is
     * part of a suspend/resume chain that starts before the current command

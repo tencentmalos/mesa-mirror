@@ -105,6 +105,8 @@ struct tu_gpuva {
    tu_gpuva(uint64_t arg) : gpuva(arg) {}
 };
 
+struct tu_dde_touch;
+
 struct tu_cs
 {
    uint32_t *start;
@@ -130,6 +132,9 @@ struct tu_cs
 
    /* iova that this CS starts with in TU_CS_MODE_EXTERNAL */
    uint64_t external_iova;
+
+   /* TU_DEBUG=dde_touch: pages referenced by draw states emitted here */
+   struct tu_dde_touch *dde_touch;
 
    /* state for cond_exec_start/cond_exec_end */
    uint32_t cond_stack_depth;
