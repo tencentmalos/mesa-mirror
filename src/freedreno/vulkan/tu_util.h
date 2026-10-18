@@ -85,6 +85,7 @@ enum tu_debug_flags : uint64_t
    TU_DEBUG_CS_DSB                   = BITFIELD64_BIT(46),
    TU_DEBUG_CS_SKIP_HEAD             = BITFIELD64_BIT(47),
    TU_DEBUG_DDE_TOUCH                = BITFIELD64_BIT(48),
+   TU_DEBUG_DDE_CHECK                = BITFIELD64_BIT(49),
 };
 
 struct tu_env {

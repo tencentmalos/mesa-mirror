@@ -712,6 +712,12 @@ struct tu_cb_control_point {
  * state references it; before the next draw the CP reads each pending page
  * once, so the draw-state fetch of that draw is no longer the first access
  * to the page in this command buffer.
+ *
+ * TU_DEBUG=dde_check (shadPS4 diagnostic for the Odin3 A830 "CP DDE BR
+ * opcode=0" fault): instead of the page start, the CP polls the first
+ * packet header of the draw state that first references the page until it
+ * reads non-zero. Entries with bit 0 set in `pending` are such header
+ * addresses.
  */
 struct tu_dde_touch {
    struct hash_table_u64 *pages;

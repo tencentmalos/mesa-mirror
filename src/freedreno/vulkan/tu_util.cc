@@ -67,6 +67,7 @@ static const struct debug_control tu_debug_options[] = {
    { "cs_dsb", TU_DEBUG_CS_DSB },
    { "cs_skip_head", TU_DEBUG_CS_SKIP_HEAD },
    { "dde_touch", TU_DEBUG_DDE_TOUCH },
+   { "dde_check", TU_DEBUG_DDE_CHECK },
    { NULL, 0 }
 };
 

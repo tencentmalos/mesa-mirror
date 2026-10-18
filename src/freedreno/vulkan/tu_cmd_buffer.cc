@@ -1229,25 +1229,36 @@ tu_dde_touch_note(struct tu_dde_touch *touch, uint64_t iova, uint32_t size)
          touch->pending = pending;
          touch->pending_capacity = capacity;
       }
-      touch->pending[touch->pending_count++] = page << 12;
+      /* A draw state starts with a packet header, which is never zero, so
+       * dde_check can poll it. A page reached only by a draw state that
+       * continues from the previous page gets the plain read.
+       */
+      if (TU_DEBUG(DDE_CHECK) && page == first)
+         touch->pending[touch->pending_count++] = iova | 1;
+      else
+         touch->pending[touch->pending_count++] = page << 12;
    }
 }
 
 /* A CP_WAIT_REG_MEM with mask 0 always passes, so this is only a read of the
- * page through the CP.
+ * page through the CP. dde_check entries instead wait until the header reads
+ * non-zero: a GPU hang stuck here means the CP also reads zero at that
+ * address, while a DDE opcode=0 fault after passing here means only the
+ * draw-state fetch sees the zero.
  */
 static void
 tu_dde_touch_flush(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
    struct tu_dde_touch *touch = &cmd->dde_touch;
    for (uint32_t i = 0; i < touch->pending_count; i++) {
+      const bool check = touch->pending[i] & 1;
       tu_cs_emit_pkt7(cs, CP_WAIT_REG_MEM, 6);
-      tu_cs_emit(cs, CP_WAIT_REG_MEM_0_FUNCTION(WRITE_EQ) |
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_0_FUNCTION(check ? WRITE_NE : WRITE_EQ) |
                      CP_WAIT_REG_MEM_0_POLL(POLL_MEMORY));
-      tu_cs_emit_qw(cs, touch->pending[i]);
+      tu_cs_emit_qw(cs, touch->pending[i] & ~(uint64_t) 1);
       tu_cs_emit(cs, CP_WAIT_REG_MEM_3_REF(0));
-      tu_cs_emit(cs, CP_WAIT_REG_MEM_4_MASK(0));
-      tu_cs_emit(cs, CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(0));
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_4_MASK(check ? ~0u : 0));
+      tu_cs_emit(cs, CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(check ? 16 : 0));
    }
    touch->pending_count = 0;
 }
@@ -4337,7 +4348,7 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
 
-   if (TU_DEBUG(DDE_TOUCH)) {
+   if (TU_DEBUG(DDE_TOUCH) || TU_DEBUG(DDE_CHECK)) {
       cmd_buffer->dde_touch.pages = _mesa_hash_table_u64_create(NULL);
       if (cmd_buffer->dde_touch.pages) {
          cmd_buffer->cs.dde_touch = &cmd_buffer->dde_touch;

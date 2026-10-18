@@ -2112,6 +2112,10 @@ kgsl_device_init(struct tu_device *dev)
       mesa_logi("Turnip: dde_touch reads every draw-state page once per "
                 "command buffer before the first draw that uses it");
 
+   if (TU_DEBUG(DDE_CHECK))
+      mesa_logi("Turnip: dde_check waits until the first draw-state header "
+                "of every newly referenced page reads non-zero");
+
    return VK_SUCCESS;
 }
 
