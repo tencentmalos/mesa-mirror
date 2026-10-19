@@ -256,15 +256,18 @@ tu_cs_get_cur_iova(const struct tu_cs *cs)
    return tu_cs_current_bo(cs)->iova + ((char *) cs->cur - (char *) tu_cs_current_bo(cs)->map);
 }
 
-/* Diagnostic (TU_CS_HAZARD=<slot>, 0-15): place every read-only command-stream
+/* Diagnostic (TU_CS_HAZARD=<slot>[:keep], 0-15): place every read-only command-stream
  * BO of at least 8 KiB so that its GPU VA starts in 4 KiB slot <slot> of a
  * 64 KiB VA block, with the lower slots of that block taken by BOs that are
  * freed right after the command-stream BO is allocated. kgsl hands out VA in
  * increasing order, so a 4 KiB probe BO tells where the next allocation goes
  * and a spacer BO fills the gap. Reproduces the layout of the A8XX CP zero
- * reads (slots 6 and 7, freed BO below) on purpose. Other threads allocating
- * at the same time can move the target; misses are counted.
+ * reads (slots 6 and 7, freed BO below) on purpose. With ":keep" the probe and
+ * spacer stay allocated (and leak), so the BO below is never freed. Other
+ * threads allocating at the same time can move the target; misses are counted.
  */
+static bool tu_cs_hazard_keep;
+
 static int
 tu_cs_hazard_slot(void)
 {
@@ -272,10 +275,12 @@ tu_cs_hazard_slot(void)
    if (slot == -2) {
       const char *env = getenv("TU_CS_HAZARD");
       int value = env ? atoi(env) : -1;
+      tu_cs_hazard_keep = env && strstr(env, ":keep");
       slot = (env && value >= 0 && value < 16) ? value : -1;
       if (slot >= 0)
-         mesa_logi("TU_CS_HAZARD=%d: command-stream BOs placed at slot %d of a 64 KiB block above freed spacers",
-                   slot, slot);
+         mesa_logi("TU_CS_HAZARD=%d%s: command-stream BOs placed at slot %d of a 64 KiB block above %s spacers",
+                   slot, tu_cs_hazard_keep ? ":keep" : "", slot,
+                   tu_cs_hazard_keep ? "kept" : "freed");
    }
    return slot;
 }
@@ -323,6 +328,8 @@ tu_cs_hazard_finish(struct tu_device *dev, struct tu_cs_hazard *hz, const struct
          mesa_logi("TU_CS_HAZARD: placed %u missed %u (last bo %" PRIx64 " target %" PRIx64 ")",
                    p_atomic_read(&placed), p_atomic_read(&missed), bo->iova, hz->target);
    }
+   if (tu_cs_hazard_keep)
+      return;
    if (hz->spacer)
       tu_bo_finish(dev, hz->spacer);
    tu_bo_finish(dev, hz->probe);
