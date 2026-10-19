@@ -147,6 +147,7 @@ struct tu_physical_device
    struct fdl_ubwc_config ubwc_config;
 
    bool has_preemption;
+   bool has_gpu_timestamp;
 
    bool expose_double_threadsize;
 

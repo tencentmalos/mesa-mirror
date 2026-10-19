@@ -1401,6 +1401,7 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
    device->has_sparse_prr = tu_drm_get_param_or(fd, MSM_PARAM_HAS_PRR, &val, false);
 
    device->has_preemption = msm_common_has_preemption(device->local_fd, device->submitqueue_priority_count / 2);
+   device->has_gpu_timestamp = true;
 
    device->is_perf_cntr_selectable = true;
 

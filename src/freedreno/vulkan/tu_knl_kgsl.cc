@@ -1786,10 +1786,22 @@ kgsl_device_finish(struct tu_device *dev)
 }
 
 static int
+kgsl_read_gpu_timestamp(int fd, uint64_t *ts)
+{
+   uint32_t source = KGSL_CALIBRATED_TIME_DOMAIN_DEVICE;
+   struct kgsl_read_calibrated_timestamps req = {
+      .sources = (uintptr_t) &source,
+      .ts = (uintptr_t) ts,
+      .count = 1,
+   };
+
+   return safe_ioctl(fd, IOCTL_KGSL_READ_CALIBRATED_TIMESTAMPS, &req);
+}
+
+static int
 kgsl_device_get_gpu_timestamp(struct tu_device *dev, uint64_t *ts)
 {
-   UNREACHABLE("");
-   return 0;
+   return kgsl_read_gpu_timestamp(dev->fd, ts);
 }
 
 static int
@@ -1984,6 +1996,9 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
 
    /* preemption is always supported on kgsl */
    device->has_preemption = true;
+
+   uint64_t gpu_timestamp;
+   device->has_gpu_timestamp = kgsl_read_gpu_timestamp(fd, &gpu_timestamp) == 0;
 
    /* KGSL doesn't allow writing the perf counter selector as the expectation is to use the uAPI provided for this. */
    device->is_perf_cntr_selectable = false;

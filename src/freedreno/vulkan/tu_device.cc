@@ -238,7 +238,8 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_acceleration_structure = has_raytracing,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
-      .KHR_calibrated_timestamps = device->info->props.has_persistent_counter,
+      .KHR_calibrated_timestamps =
+         device->info->props.has_persistent_counter && device->has_gpu_timestamp,
       .KHR_compute_shader_derivatives = true,
       .KHR_copy_commands2 = true,
       // TODO workaround for https://github.com/KhronosGroup/VK-GL-CTS/issues/525
@@ -337,7 +338,8 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_attachment_feedback_loop_dynamic_state = true,
       .EXT_attachment_feedback_loop_layout = true,
       .EXT_border_color_swizzle = true,
-      .EXT_calibrated_timestamps = device->info->props.has_persistent_counter,
+      .EXT_calibrated_timestamps =
+         device->info->props.has_persistent_counter && device->has_gpu_timestamp,
       .EXT_color_write_enable = true,
       .EXT_conditional_rendering = true,
       .EXT_conservative_rasterization = device->info->chip >= 7,
@@ -395,7 +397,8 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_pipeline_creation_cache_control = true,
       .EXT_pipeline_creation_feedback = true,
 #ifdef TU_USE_WSI_PLATFORM
-      .EXT_present_timing = device->info->props.has_persistent_counter,
+      .EXT_present_timing =
+         device->info->props.has_persistent_counter && device->has_gpu_timestamp,
 #endif
       .EXT_primitive_restart_index = true,
       .EXT_primitive_topology_list_restart = true,

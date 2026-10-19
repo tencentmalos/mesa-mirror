@@ -1357,6 +1357,7 @@ tu_knl_drm_virtio_load(struct tu_instance *instance,
    device->has_lazy_bos   = true;
    device->has_iova_align = true;
    device->has_preemption = has_preemption;
+   device->has_gpu_timestamp = true;
    device->is_perf_cntr_selectable = true;
    device->uche_trap_base = uche_trap_base;
 
