@@ -281,6 +281,16 @@ tu_lrz_init_state(struct tu_cmd_buffer *cmd,
       return;
    }
 
+   /* Diagnostic: a render pass that loads depth does not continue from the LRZ
+    * state the previous pass left behind. Invalidating here makes the begin
+    * sequence write an invalid depth view into the LRZ buffer, so later passes
+    * fail the view comparison too. Passes that clear depth still use LRZ.
+    */
+   if (TU_DEBUG(LRZ_NO_REUSE) && !clears_depth) {
+      tu_lrz_invalidate(cmd, "TU_DEBUG=lrznoreuse: depth is loaded, not cleared");
+      return;
+   }
+
    if (!clears_depth && !att->load) {
       tu_lrz_invalidate(cmd, "Depth attachment isn't loaded or cleared");
       return;

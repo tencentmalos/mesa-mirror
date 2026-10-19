@@ -9,7 +9,100 @@
 #include "tu_rmv.h"
 #include "tu_suballoc.h"
 
+#include "util/simple_mtx.h"
+
 uint32_t tu_cs_fail_sink[TU_CS_FAIL_SINK_SIZE];
+
+/* TU_DEBUG=csbocache: BOs released by tu_cs_reset/tu_cs_finish are kept and
+ * handed to the next tu_cs_add_bo of the same size and kind, instead of being
+ * freed and allocated again. A command stream then keeps reusing the same
+ * GPU addresses and pages, and no IOMMU unmap (with its TLB invalidation) is
+ * issued for command memory while the GPU runs.
+ */
+#define TU_CS_BO_CACHE_SLOTS 256
+#define TU_CS_BO_CACHE_BYTES (96ull << 20)
+
+struct tu_cs_bo_cache_slot {
+   struct tu_device *device;
+   struct tu_bo *bo;
+   uint64_t seq;
+   bool read_only;
+};
+
+static simple_mtx_t tu_cs_bo_cache_mtx = SIMPLE_MTX_INITIALIZER;
+static struct tu_cs_bo_cache_slot tu_cs_bo_cache[TU_CS_BO_CACHE_SLOTS];
+static uint64_t tu_cs_bo_cache_bytes;
+static uint64_t tu_cs_bo_cache_seq;
+
+static struct tu_bo *
+tu_cs_bo_cache_get(struct tu_device *device, uint64_t bytes, bool read_only)
+{
+   struct tu_bo *bo = NULL;
+   int best = -1;
+
+   simple_mtx_lock(&tu_cs_bo_cache_mtx);
+   for (int i = 0; i < TU_CS_BO_CACHE_SLOTS; i++) {
+      const struct tu_cs_bo_cache_slot *slot = &tu_cs_bo_cache[i];
+      if (!slot->bo || slot->device != device || slot->read_only != read_only ||
+          slot->bo->size < bytes || slot->bo->size >= bytes + 65536)
+         continue;
+      /* Oldest first: the longest time since the GPU last used it. */
+      if (best < 0 || slot->seq < tu_cs_bo_cache[best].seq)
+         best = i;
+   }
+   if (best >= 0) {
+      bo = tu_cs_bo_cache[best].bo;
+      tu_cs_bo_cache[best].bo = NULL;
+      tu_cs_bo_cache_bytes -= bo->size;
+   }
+   simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+   return bo;
+}
+
+static void
+tu_cs_release_bo(struct tu_cs *cs, struct tu_bo *bo, bool read_only)
+{
+   if (TU_DEBUG(CS_BO_CACHE) && bo->map && p_atomic_read(&bo->refcnt) == 1) {
+      simple_mtx_lock(&tu_cs_bo_cache_mtx);
+      if (tu_cs_bo_cache_bytes + bo->size <= TU_CS_BO_CACHE_BYTES) {
+         for (int i = 0; i < TU_CS_BO_CACHE_SLOTS; i++) {
+            struct tu_cs_bo_cache_slot *slot = &tu_cs_bo_cache[i];
+            if (slot->bo)
+               continue;
+            slot->device = cs->device;
+            slot->bo = bo;
+            slot->seq = tu_cs_bo_cache_seq++;
+            slot->read_only = read_only;
+            tu_cs_bo_cache_bytes += bo->size;
+            simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+            return;
+         }
+      }
+      simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+   }
+   tu_bo_finish(cs->device, bo);
+}
+
+void
+tu_cs_bo_cache_release_device(struct tu_device *device)
+{
+   struct tu_bo *bos[TU_CS_BO_CACHE_SLOTS];
+   unsigned count = 0;
+
+   simple_mtx_lock(&tu_cs_bo_cache_mtx);
+   for (int i = 0; i < TU_CS_BO_CACHE_SLOTS; i++) {
+      struct tu_cs_bo_cache_slot *slot = &tu_cs_bo_cache[i];
+      if (slot->bo && slot->device == device) {
+         bos[count++] = slot->bo;
+         tu_cs_bo_cache_bytes -= slot->bo->size;
+         slot->bo = NULL;
+      }
+   }
+   simple_mtx_unlock(&tu_cs_bo_cache_mtx);
+
+   for (unsigned i = 0; i < count; i++)
+      tu_bo_finish(device, bos[i]);
+}
 
 /* There is a limit to IB size supported by HW,
  * which appears to be 0x0fffff.
@@ -108,12 +201,12 @@ tu_cs_finish(struct tu_cs *cs)
 {
    for (uint32_t i = 0; i < cs->read_only.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+      tu_cs_release_bo(cs, cs->read_only.bos[i], true);
    }
 
    for (uint32_t i = 0; i < cs->read_write.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+      tu_cs_release_bo(cs, cs->read_write.bos[i], false);
    }
 
    if (cs->refcount_bo)
@@ -192,17 +285,38 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
       bos->bos = new_bos;
    }
 
-   struct tu_bo *new_bo;
    const uint32_t skip = tu_cs_head_skip(size);
+   /* TU_DEBUG=csbocache hands out whole cached BOs; cs_skip_head is not
+    * applied to them.
+    */
+   struct tu_bo *new_bo = TU_DEBUG(CS_BO_CACHE) ?
+      tu_cs_bo_cache_get(cs->device, size * sizeof(uint32_t), !cs->writeable) : NULL;
+   if (new_bo) {
+      TU_RMV(cmd_buffer_bo_create, cs->device, new_bo);
+      bos->bos[bos->bo_count++] = new_bo;
+      cs->start = cs->cur = cs->reserved_end = (uint32_t *) new_bo->map;
+      cs->end = cs->start + size;
+      return VK_SUCCESS;
+   }
 
+   /* TU_DEBUG=csalign64k: give command stream BOs a 64 KiB aligned GPU VA,
+    * so that no last-level page table cache line (8 PTEs, 32 KiB of VA) is
+    * shared with another BO. On A8XX the CP has been seen to fetch zeros for
+    * the second page of a command BO whose first PTEs share a line with a
+    * BO that was freed earlier.
+    */
    VkResult result =
-      tu_bo_init_new(cs->device, NULL, &new_bo,
-                     (size + skip) * sizeof(uint32_t),
-                     (enum tu_bo_alloc_flags)(COND(!cs->writeable,
-                                                   TU_BO_ALLOC_GPU_READ_ONLY) |
-                                              TU_BO_ALLOC_ALLOW_DUMP |
-                                              tu_bo_ib_flags(cs->device)),
-                     cs->name);
+      tu_bo_init_new_explicit_iova(
+         cs->device, NULL, &new_bo, (size + skip) * sizeof(uint32_t),
+         TU_DEBUG(CS_ALIGN_64K) ? 64 * 1024 : 0, 0,
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+         (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+                                       TU_BO_ALLOC_GPU_READ_ONLY) |
+                                  TU_BO_ALLOC_ALLOW_DUMP |
+                                  tu_bo_ib_flags(cs->device)),
+         NULL, cs->name);
    if (result != VK_SUCCESS) {
       return result;
    }
@@ -372,6 +486,17 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
 {
    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
    assert(size);
+
+   /* TU_DEBUG=ib2pagesplit: keep a sub stream that fits in a page (draw
+    * states read by the DDE) within one page, see tu_cs_page_split().
+    */
+   if (unlikely(cs->page_split) && cs->cur && count * size < 1024) {
+      const uint32_t left = 1024 - ((tu_cs_get_cur_iova(cs) & 4095) / 4);
+      if (left < count * size && tu_cs_get_space(cs) >= left + count * size) {
+         cs->cur += left;
+         cs->start = cs->cur;
+      }
+   }
 
    VkResult result;
    if (tu_cs_get_space(cs) < count * size) {
@@ -587,6 +712,77 @@ tu_cs_align_draw_state(struct tu_cs *cs, uint16_t cnt)
 }
 
 /**
+ * TU_DEBUG=ib2pagesplit workaround for A8XX: the CP has been seen to fetch
+ * zeros instead of the second page of an IB2 that crosses a 4 KiB boundary,
+ * although the memory holds the right commands and no SMMU fault is raised.
+ * When the next reservation would cross the boundary, pad the current page
+ * with a NOP and start a new IB entry on the next page, so that every IB of
+ * the stream lies within one page. Conditional execution regions are closed
+ * at the split and reopened after it, like on a BO switch. Reservations of a
+ * page or more cannot be kept within a page and are left alone.
+ */
+void
+tu_cs_page_split(struct tu_cs *cs, uint32_t reserved_size)
+{
+   assert(cs->mode == TU_CS_MODE_GROW);
+   if (cs->status != VK_SUCCESS || !cs->cur)
+      return;
+
+   const uint32_t cond_size = 3 * cs->cond_stack_depth;
+   if (reserved_size + cond_size >= 1024)
+      return;
+
+   const uint32_t left = 1024 - ((tu_cs_get_cur_iova(cs) & 4095) / 4);
+   if (reserved_size <= left)
+      return;
+
+   /* Not enough room in this BO: tu_cs_reserve_space() switches to a new,
+    * page-aligned BO anyway.
+    */
+   if (tu_cs_get_space(cs) < left + reserved_size + cond_size)
+      return;
+
+   if (tu_cs_is_empty(cs)) {
+      /* Nothing to end yet: start the next entry on the next page. */
+      cs->cur += left;
+      cs->start = cs->cur;
+      cs->reserved_end = cs->cur;
+      return;
+   }
+
+   if (tu_cs_reserve_entry(cs) != VK_SUCCESS) {
+      tu_cs_fail(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+      /* Subtract one here to account for the DWORD field itself. */
+      *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
+   }
+
+   cs->reserved_end = cs->cur + left;
+   tu_cs_emit(cs, pm4_pkt7_hdr(CP_NOP, left - 1));
+   for (uint32_t i = 1; i < left; i++)
+      tu_cs_emit(cs, 0);
+   tu_cs_add_entry(cs);
+
+   static std::atomic<uint32_t> logged{0};
+   if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+      mesa_logi("IB2 page split (%s): next IB starts at 0x%" PRIx64 ", padded %u dwords",
+                cs->name, tu_cs_get_cur_iova(cs), left);
+
+   cs->reserved_end = cs->cur + cond_size;
+   for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+      tu_cs_emit(cs, pm4_pkt7_hdr(CP_COND_REG_EXEC, 2));
+      tu_cs_emit(cs, cs->cond_flags[i]);
+      cs->cond_dwords[i] = cs->cur;
+      /* Emit dummy DWORD field here */
+      tu_cs_emit(cs, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(0));
+   }
+   cs->reserved_end = cs->cur;
+}
+
+/**
  * Reset a command stream to its initial state.  This discards all comand
  * packets in \a cs, but does not necessarily release all resources.
  */
@@ -604,12 +800,12 @@ tu_cs_reset(struct tu_cs *cs)
 
    for (uint32_t i = 0; i + 1 < cs->read_only.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+      tu_cs_release_bo(cs, cs->read_only.bos[i], true);
    }
 
    for (uint32_t i = 0; i + 1 < cs->read_write.bo_count; ++i) {
       TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+      tu_cs_release_bo(cs, cs->read_write.bos[i], false);
    }
 
    assert(!cs->writeable);

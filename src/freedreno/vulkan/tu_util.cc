@@ -68,6 +68,11 @@ static const struct debug_control tu_debug_options[] = {
    { "cs_skip_head", TU_DEBUG_CS_SKIP_HEAD },
    { "dde_touch", TU_DEBUG_DDE_TOUCH },
    { "dde_check", TU_DEBUG_DDE_CHECK },
+   { "cmdaudit", TU_DEBUG_CMD_AUDIT },
+   { "csbocache", TU_DEBUG_CS_BO_CACHE },
+   { "ib2pagesplit", TU_DEBUG_IB2_PAGE_SPLIT },
+   { "csalign64k", TU_DEBUG_CS_ALIGN_64K },
+   { "lrznoreuse", TU_DEBUG_LRZ_NO_REUSE },
    { NULL, 0 }
 };
 

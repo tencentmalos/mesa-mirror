@@ -4357,6 +4357,18 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
       }
    }
 
+   /* TU_DEBUG=ib2pagesplit: keep every IB2 and draw state within one 4 KiB
+    * page, see tu_cs_page_split(). The IB1 (cmd cs) is left alone.
+    */
+   if (TU_DEBUG(IB2_PAGE_SPLIT)) {
+      cmd_buffer->draw_cs.page_split = true;
+      cmd_buffer->tile_store_cs.page_split = true;
+      cmd_buffer->draw_epilogue_cs.page_split = true;
+      cmd_buffer->sub_cs.page_split = true;
+      cmd_buffer->pre_chain.draw_cs.page_split = true;
+      cmd_buffer->pre_chain.draw_epilogue_cs.page_split = true;
+   }
+
    for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
       cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
 
@@ -4614,6 +4626,28 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
    tu_cs_begin(&cmd_buffer->cs);
    tu_cs_begin(&cmd_buffer->draw_cs);
    tu_cs_begin(&cmd_buffer->draw_epilogue_cs);
+
+   /* Diagnostic (TU_DRAW_CS_PAD_DW=<dwords>): emit an uncalled NOP block at the
+    * start of draw_cs to shift where the render pass IB2s land in the BO, to
+    * tell a fault tied to the first IB2 page crossing of a submission from one
+    * tied to a particular IB2.
+    */
+   static int draw_cs_pad_dw = -1;
+   if (draw_cs_pad_dw < 0) {
+      const char *env = getenv("TU_DRAW_CS_PAD_DW");
+      draw_cs_pad_dw = env ? CLAMP(atoi(env), 0, 4096) : 0;
+      if (draw_cs_pad_dw)
+         mesa_logi("TU_DRAW_CS_PAD_DW=%d: draw_cs starts with an uncalled %d dword NOP block",
+                   draw_cs_pad_dw, draw_cs_pad_dw);
+   }
+   if (draw_cs_pad_dw >= 2) {
+      tu_cs_emit_pkt7(&cmd_buffer->draw_cs, CP_NOP, draw_cs_pad_dw - 1);
+      for (int i = 1; i < draw_cs_pad_dw; i++)
+         tu_cs_emit(&cmd_buffer->draw_cs, 0);
+      tu_cs_end(&cmd_buffer->draw_cs);
+      tu_cs_discard_entries(&cmd_buffer->draw_cs);
+      tu_cs_begin(&cmd_buffer->draw_cs);
+   }
 
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       if (u_trace_enabled(&cmd_buffer->device->trace_context)) {

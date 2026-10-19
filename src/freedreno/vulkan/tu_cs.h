@@ -118,6 +118,10 @@ struct tu_cs
    struct tu_device *device;
    enum tu_cs_mode mode;
    bool writeable;
+   /* TU_DEBUG=ib2pagesplit: never let an IB of this TU_CS_MODE_GROW stream
+    * span a 4 KiB page, see tu_cs_page_split().
+    */
+   bool page_split;
    uint32_t next_bo_size;
    VkResult status;
 
@@ -260,6 +264,10 @@ tu_cs_init_suballoc(struct tu_cs *cs, struct tu_device *device,
 
 void
 tu_cs_finish(struct tu_cs *cs);
+
+/* Frees the command-stream BOs kept by TU_DEBUG=csbocache for this device. */
+void
+tu_cs_bo_cache_release_device(struct tu_device *device);
 
 void
 tu_cs_begin(struct tu_cs *cs);
@@ -448,6 +456,8 @@ tu_cs_get_space(const struct tu_cs *cs)
    return cs->end - cs->cur;
 }
 
+void tu_cs_page_split(struct tu_cs *cs, uint32_t reserved_size);
+
 static inline void
 tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
 {
@@ -461,6 +471,9 @@ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
       assert(cs->reserved_end == cs->end);
       return;
    }
+
+   if (unlikely(cs->page_split))
+      tu_cs_page_split(cs, reserved_size);
 
    if (tu_cs_get_space(cs) >= reserved_size &&
        cs->entry_count < cs->entry_capacity) {

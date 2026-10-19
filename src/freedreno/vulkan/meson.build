@@ -40,6 +40,7 @@ libtu_files = files(
   'tu_clear_blit.cc',
   'tu_cmd_buffer.cc',
   'tu_cs_breadcrumbs.cc',
+  'tu_cmd_audit.cc',
   'tu_cs.cc',
   'tu_device.cc',
   'tu_deferred.cc',

@@ -14,6 +14,7 @@
 #include "vk_util.h"
 
 #include "tu_buffer.h"
+#include "tu_cmd_audit.h"
 #include "tu_cmd_buffer.h"
 #include "tu_device.h"
 #include "tu_dynamic_rendering.h"
@@ -569,6 +570,9 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       pthread_mutex_unlock(&device->submit_mutex);
       goto out;
    }
+
+   if (TU_DEBUG(CMD_AUDIT))
+      tu_cmd_audit_submit(queue, cmd_buffers, cmdbuf_count);
 
    tu_debug_bos_print_stats(device);
 
