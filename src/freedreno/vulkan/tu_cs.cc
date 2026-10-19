@@ -256,6 +256,78 @@ tu_cs_get_cur_iova(const struct tu_cs *cs)
    return tu_cs_current_bo(cs)->iova + ((char *) cs->cur - (char *) tu_cs_current_bo(cs)->map);
 }
 
+/* Diagnostic (TU_CS_HAZARD=<slot>, 0-15): place every read-only command-stream
+ * BO of at least 8 KiB so that its GPU VA starts in 4 KiB slot <slot> of a
+ * 64 KiB VA block, with the lower slots of that block taken by BOs that are
+ * freed right after the command-stream BO is allocated. kgsl hands out VA in
+ * increasing order, so a 4 KiB probe BO tells where the next allocation goes
+ * and a spacer BO fills the gap. Reproduces the layout of the A8XX CP zero
+ * reads (slots 6 and 7, freed BO below) on purpose. Other threads allocating
+ * at the same time can move the target; misses are counted.
+ */
+static int
+tu_cs_hazard_slot(void)
+{
+   static int slot = -2;
+   if (slot == -2) {
+      const char *env = getenv("TU_CS_HAZARD");
+      int value = env ? atoi(env) : -1;
+      slot = (env && value >= 0 && value < 16) ? value : -1;
+      if (slot >= 0)
+         mesa_logi("TU_CS_HAZARD=%d: command-stream BOs placed at slot %d of a 64 KiB block above freed spacers",
+                   slot, slot);
+   }
+   return slot;
+}
+
+struct tu_cs_hazard {
+   struct tu_bo *probe;
+   struct tu_bo *spacer;
+   uint64_t target;
+};
+
+static void
+tu_cs_hazard_place(struct tu_device *dev, enum tu_bo_alloc_flags flags,
+                   uint64_t size_bytes, struct tu_cs_hazard *hz)
+{
+   hz->probe = NULL;
+   hz->spacer = NULL;
+   hz->target = 0;
+   const int slot = tu_cs_hazard_slot();
+   if (slot < 0 || size_bytes < 8192 || !(flags & TU_BO_ALLOC_GPU_READ_ONLY) ||
+       TU_DEBUG(CS_ALIGN_64K) || TU_DEBUG(RO_ALIGN_64K))
+      return;
+   if (tu_bo_init_new(dev, NULL, &hz->probe, 4096, flags, "cs hazard probe") != VK_SUCCESS) {
+      hz->probe = NULL;
+      return;
+   }
+   const uint64_t next = hz->probe->iova + 4096;
+   uint64_t target = (next & ~(uint64_t) 0xffff) + (uint64_t) slot * 4096;
+   if (target < next + 4096)
+      target += 0x10000;
+   if (tu_bo_init_new(dev, NULL, &hz->spacer, target - next, flags, "cs hazard spacer") != VK_SUCCESS)
+      hz->spacer = NULL;
+   hz->target = target;
+}
+
+static void
+tu_cs_hazard_finish(struct tu_device *dev, struct tu_cs_hazard *hz, const struct tu_bo *bo)
+{
+   static uint32_t placed, missed;
+   if (!hz->probe)
+      return;
+   if (bo && hz->target) {
+      const bool hit = bo->iova == hz->target;
+      const uint32_t n = p_atomic_inc_return(hit ? &placed : &missed);
+      if ((hit && (n == 1 || n % 256 == 0)) || (!hit && (n == 1 || n % 64 == 0)))
+         mesa_logi("TU_CS_HAZARD: placed %u missed %u (last bo %" PRIx64 " target %" PRIx64 ")",
+                   p_atomic_read(&placed), p_atomic_read(&missed), bo->iova, hz->target);
+   }
+   if (hz->spacer)
+      tu_bo_finish(dev, hz->spacer);
+   tu_bo_finish(dev, hz->probe);
+}
+
 /*
  * Allocate and add a BO to a command stream.  Following command packets will
  * be emitted to the new BO.
@@ -305,6 +377,12 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
     * the second page of a command BO whose first PTEs share a line with a
     * BO that was freed earlier.
     */
+   const enum tu_bo_alloc_flags bo_flags =
+      (enum tu_bo_alloc_flags)(COND(!cs->writeable, TU_BO_ALLOC_GPU_READ_ONLY) |
+                               TU_BO_ALLOC_ALLOW_DUMP |
+                               tu_bo_ib_flags(cs->device));
+   struct tu_cs_hazard hazard;
+   tu_cs_hazard_place(cs->device, bo_flags, (size + skip) * sizeof(uint32_t), &hazard);
    VkResult result =
       tu_bo_init_new_explicit_iova(
          cs->device, NULL, &new_bo, (size + skip) * sizeof(uint32_t),
@@ -312,11 +390,8 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-         (enum tu_bo_alloc_flags)(COND(!cs->writeable,
-                                       TU_BO_ALLOC_GPU_READ_ONLY) |
-                                  TU_BO_ALLOC_ALLOW_DUMP |
-                                  tu_bo_ib_flags(cs->device)),
-         NULL, cs->name);
+         bo_flags, NULL, cs->name);
+   tu_cs_hazard_finish(cs->device, &hazard, result == VK_SUCCESS ? new_bo : NULL);
    if (result != VK_SUCCESS) {
       return result;
    }
