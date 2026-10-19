@@ -541,6 +541,15 @@ kgsl_bo_init(struct tu_device *dev,
    if (flags & TU_BO_ALLOC_REPLAYABLE)
       req.flags |= KGSL_MEMFLAGS_USE_CPU_MAP;
 
+   /* TU_DEBUG=roalign64k: every GPU read-only BO (command streams and the
+    * pipeline suballocator) gets a 64 KiB aligned GPU VA. On A8XX the CP has
+    * been seen to read zeros from the 4 KiB pages at offsets 0x6000/0x7000 of
+    * a 64 KiB VA block whose lower pages belonged to a freed BO; with 64 KiB
+    * alignment such pages are always interior pages of the same BO.
+    */
+   if (TU_DEBUG(RO_ALIGN_64K) && (flags & TU_BO_ALLOC_GPU_READ_ONLY))
+      align = MAX2(align, 64 * 1024);
+
    req.flags |= kgsl_align_flag(align);
 
    /* TU_DEBUG=cs_recycle hands back retired command-stream storage, matched
