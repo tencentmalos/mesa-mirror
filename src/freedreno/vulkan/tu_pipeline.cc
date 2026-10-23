@@ -1911,6 +1911,8 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
          builder->graphics_state.mv->view_mask;
       keys[MESA_SHADER_FRAGMENT].fragment_density_map =
          builder->fragment_density_map;
+      keys[MESA_SHADER_FRAGMENT].fdm_visualize =
+         builder->fragment_density_map && TU_DEBUG(FDM_VISUALIZE);
       keys[MESA_SHADER_FRAGMENT].fdm_per_layer =
          builder->fdm_per_layer;
       keys[MESA_SHADER_FRAGMENT].max_fdm_layers = builder->max_fdm_layers;

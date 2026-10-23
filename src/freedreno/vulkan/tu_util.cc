@@ -63,6 +63,7 @@ static const struct debug_control tu_debug_options[] = {
    { "kgsl_preempt_fg", TU_DEBUG_KGSL_PREEMPT_FG },
    { "cmd_no_preempt", TU_DEBUG_CMD_NO_PREEMPT },
    { "lrzfc", TU_DEBUG_LRZFC },
+   { "fdmviz", TU_DEBUG_FDM_VISUALIZE },
    { NULL, 0 }
 };
 

@@ -1710,6 +1710,61 @@ tu_nir_lower_fdm(nir_shader *shader, const struct lower_fdm_options *options)
 }
 
 static bool
+tu_nir_visualize_fdm_instr(nir_builder *b, nir_intrinsic_instr *intrin,
+                           void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_store_deref)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+   if (deref->deref_type != nir_deref_type_var ||
+       !nir_deref_mode_is(deref, nir_var_shader_out))
+      return false;
+
+   nir_variable *var = deref->var;
+   if ((var->data.location != FRAG_RESULT_DATA0 &&
+        var->data.location != FRAG_RESULT_COLOR) ||
+       var->data.index != 0)
+      return false;
+
+   enum glsl_base_type base = glsl_get_base_type(var->type);
+   if (base != GLSL_TYPE_FLOAT && base != GLSL_TYPE_FLOAT16)
+      return false;
+
+   nir_def *value = intrin->src[1].ssa;
+   if (value->num_components < 3)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *size = nir_load_frag_size(b);
+   nir_def *area = nir_imul(b, nir_channel(b, size, 0), nir_channel(b, size, 1));
+   nir_def *tint =
+      nir_bcsel(b, nir_ige_imm(b, area, 16), nir_imm_vec3(b, 1.0, 0.0, 0.0),
+      nir_bcsel(b, nir_ige_imm(b, area, 8), nir_imm_vec3(b, 1.0, 0.5, 0.0),
+      nir_bcsel(b, nir_ige_imm(b, area, 4), nir_imm_vec3(b, 1.0, 1.0, 0.0),
+                nir_imm_vec3(b, 0.0, 1.0, 0.0))));
+   nir_def *amount = nir_bcsel(b, nir_ige_imm(b, area, 2),
+                               nir_imm_float(b, 0.5), nir_imm_float(b, 0.0));
+   tint = nir_f2fN(b, tint, value->bit_size);
+   amount = nir_replicate(b, nir_f2fN(b, amount, value->bit_size), 3);
+   nir_def *color = nir_trim_vector(b, value, 3);
+   nir_def *rgb = nir_fadd(b, color, nir_fmul(b, nir_fsub(b, tint, color), amount));
+
+   nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < value->num_components; i++)
+      channels[i] = i < 3 ? nir_channel(b, rgb, i) : nir_channel(b, value, i);
+   nir_src_rewrite(&intrin->src[1], nir_vec(b, channels, value->num_components));
+   return true;
+}
+
+static bool
+tu_nir_visualize_fdm(nir_shader *shader)
+{
+   return nir_shader_intrinsics_pass(shader, tu_nir_visualize_fdm_instr,
+                                     nir_metadata_control_flow, NULL);
+}
+
+static bool
 lower_ssbo_descriptor_instr(nir_builder *b, nir_intrinsic_instr *intrin,
                             void *cb_data)
 {
@@ -3491,6 +3546,8 @@ tu_lower_nir(struct tu_device *dev,
       .use_layer = !key->multiview_mask,
       .adjust_gmem_fragcoord = key->fragment_density_map && key->custom_resolve,
    };
+   if (key->fdm_visualize && nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, tu_nir_visualize_fdm);
    NIR_PASS(_, nir, tu_nir_lower_fdm, &fdm_options);
 
    if (nir->info.stage != MESA_SHADER_FRAGMENT &&
