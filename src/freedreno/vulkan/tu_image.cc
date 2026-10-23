@@ -923,6 +923,18 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
 
+static const VkImageCreateInfo *
+tu_image_create_info_clamp_samples(const VkImageCreateInfo *info,
+                                   VkImageCreateInfo *clamped)
+{
+   VkSampleCountFlagBits samples = tu_clamp_samples(info->samples);
+   if (samples == info->samples)
+      return info;
+   *clamped = *info;
+   clamped->samples = samples;
+   return clamped;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateImage(VkDevice _device,
                const VkImageCreateInfo *pCreateInfo,
@@ -932,8 +944,11 @@ tu_CreateImage(VkDevice _device,
    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
    const VkSubresourceLayout *plane_layouts = NULL;
    VkResult result;
+   VkImageCreateInfo clamped_info;
 
    VK_FROM_HANDLE(tu_device, device, _device);
+
+   pCreateInfo = tu_image_create_info_clamp_samples(pCreateInfo, &clamped_info);
 
    if (wsi_common_is_swapchain_image(pCreateInfo)) {
       return wsi_common_create_swapchain_image(device->physical_device->vk.wsi_device,
@@ -1414,9 +1429,12 @@ tu_GetDeviceImageMemoryRequirements(
    VK_FROM_HANDLE(tu_device, device, _device);
 
    struct tu_image image = {0};
+   VkImageCreateInfo clamped_info;
+   const VkImageCreateInfo *create_info =
+      tu_image_create_info_clamp_samples(pInfo->pCreateInfo, &clamped_info);
 
-   vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   vk_image_init(&device->vk, &image.vk, create_info);
+   TU_CALLX(device, tu_image_init)(device, &image, create_info, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
 
    tu_get_image_memory_requirements(device, &image, pMemoryRequirements);
 }
@@ -1431,9 +1449,12 @@ tu_GetDeviceImageSparseMemoryRequirements(
    VK_FROM_HANDLE(tu_device, device, _device);
 
    struct tu_image image = {0};
+   VkImageCreateInfo clamped_info;
+   const VkImageCreateInfo *create_info =
+      tu_image_create_info_clamp_samples(pInfo->pCreateInfo, &clamped_info);
 
-   vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   vk_image_init(&device->vk, &image.vk, create_info);
+   TU_CALLX(device, tu_image_init)(device, &image, create_info, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
 
    tu_get_image_sparse_memory_requirements(device, &image,
                                            pSparseMemoryRequirementCount,
@@ -1522,9 +1543,12 @@ tu_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
    VK_FROM_HANDLE(tu_device, device, _device);
 
    struct tu_image image = {0};
+   VkImageCreateInfo clamped_info;
+   const VkImageCreateInfo *create_info =
+      tu_image_create_info_clamp_samples(pInfo->pCreateInfo, &clamped_info);
 
-   vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   vk_image_init(&device->vk, &image.vk, create_info);
+   TU_CALLX(device, tu_image_init)(device, &image, create_info, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
 
    tu_get_image_subresource_layout(&image, pInfo->pSubresource, pLayout);
 }

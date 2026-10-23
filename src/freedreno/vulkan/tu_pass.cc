@@ -1095,6 +1095,25 @@ tu_CreateRenderPass2(VkDevice _device,
       return vk_common_CreateRenderPass2(_device, pCreateInfo, pAllocator,
                                          pRenderPass);
 
+   VkRenderPassCreateInfo2 clamped_info;
+   VkAttachmentDescription2 clamped_attachments[32];
+   if (tu_env.max_samples &&
+       pCreateInfo->attachmentCount <= ARRAY_SIZE(clamped_attachments)) {
+      bool clamped = false;
+      for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+         clamped_attachments[i] = pCreateInfo->pAttachments[i];
+         clamped_attachments[i].samples =
+            tu_clamp_samples(clamped_attachments[i].samples);
+         clamped |= clamped_attachments[i].samples !=
+                    pCreateInfo->pAttachments[i].samples;
+      }
+      if (clamped) {
+         clamped_info = *pCreateInfo;
+         clamped_info.pAttachments = clamped_attachments;
+         pCreateInfo = &clamped_info;
+      }
+   }
+
    struct tu_render_pass *pass;
    size_t size;
    size_t attachments_offset;

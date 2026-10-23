@@ -87,9 +87,17 @@ enum tu_debug_flags : uint64_t
 struct tu_env {
     std::atomic<uint64_t> debug;
     uint64_t start_debug;
+    uint32_t max_samples;
 };
 
 extern struct tu_env tu_env;
+
+static inline VkSampleCountFlagBits
+tu_clamp_samples(VkSampleCountFlagBits samples)
+{
+   return tu_env.max_samples && (uint32_t) samples > tu_env.max_samples ?
+      (VkSampleCountFlagBits) tu_env.max_samples : samples;
+}
 
 /*
  * Note: tu_env_init() must be called before using the TU_DEBUG* macro.

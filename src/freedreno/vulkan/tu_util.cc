@@ -138,6 +138,14 @@ tu_env_init_once(void)
 {
    tu_env.start_debug = tu_env.debug = parse_debug_string(os_get_option("TU_DEBUG"), tu_debug_options);
 
+   const char *max_samples = os_get_option("TU_MAX_SAMPLES");
+   tu_env.max_samples = max_samples ? atoi(max_samples) : 0;
+   if (tu_env.max_samples != 1 && tu_env.max_samples != 2 &&
+       tu_env.max_samples != 4 && tu_env.max_samples != 8)
+      tu_env.max_samples = 0;
+   if (tu_env.max_samples)
+      mesa_logi("TU_MAX_SAMPLES=%u", tu_env.max_samples);
+
    if (TU_DEBUG(STARTUP))
       mesa_logi("TU_DEBUG=0x%" PRIx64, tu_env.debug.load());
 

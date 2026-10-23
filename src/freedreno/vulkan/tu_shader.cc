@@ -1758,6 +1758,62 @@ tu_nir_visualize_fdm_instr(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 static bool
+tu_nir_clamp_sample_index_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   const uint32_t max_samples = *(const uint32_t *) data;
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (tex->op != nir_texop_txf_ms)
+         return false;
+      int index = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+      if (index < 0)
+         return false;
+      nir_def *sample = tex->src[index].src.ssa;
+      b->cursor = nir_before_instr(instr);
+      nir_src_rewrite(&tex->src[index].src,
+                      nir_umin(b, sample, nir_imm_intN_t(b, max_samples - 1,
+                                                         sample->bit_size)));
+      return true;
+   }
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+   if (glsl_get_sampler_dim(glsl_without_array(deref->type)) !=
+       GLSL_SAMPLER_DIM_MS)
+      return false;
+
+   nir_def *sample = intrin->src[2].ssa;
+   b->cursor = nir_before_instr(instr);
+   nir_src_rewrite(&intrin->src[2],
+                   nir_umin(b, sample, nir_imm_intN_t(b, max_samples - 1,
+                                                      sample->bit_size)));
+   return true;
+}
+
+static bool
+tu_nir_clamp_sample_index(nir_shader *shader, uint32_t max_samples)
+{
+   return nir_shader_instructions_pass(shader, tu_nir_clamp_sample_index_instr,
+                                       nir_metadata_control_flow,
+                                       &max_samples);
+}
+
+static bool
 tu_nir_visualize_fdm(nir_shader *shader)
 {
    return nir_shader_intrinsics_pass(shader, tu_nir_visualize_fdm_instr,
@@ -3506,6 +3562,9 @@ tu_lower_nir(struct tu_device *dev,
       .is_vulkan = true,
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
+
+   if (tu_env.max_samples)
+      NIR_PASS(_, nir, tu_nir_clamp_sample_index, tu_env.max_samples);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const nir_input_attachment_options att_options = {

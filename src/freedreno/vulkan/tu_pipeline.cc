@@ -3008,6 +3008,10 @@ void
 tu6_emit_sample_locations(struct tu_cs *cs, bool enable,
                           const struct vk_sample_locations_state *samp_loc)
 {
+   if (enable && tu_env.max_samples &&
+       (uint32_t) samp_loc->per_pixel > tu_env.max_samples)
+      enable = false;
+
    tu_cs_emit_regs(cs, GRAS_SC_MSAA_SAMPLE_POS_CNTL(CHIP,
       .location_enable = enable,
    ));

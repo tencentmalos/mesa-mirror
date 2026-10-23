@@ -131,6 +131,8 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    _mesa_blake3_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
    _mesa_blake3_update(&ctx, &device->compiler_options,
                        sizeof(device->compiler_options));
+   if (tu_env.max_samples)
+      _mesa_blake3_update(&ctx, &tu_env.max_samples, sizeof(tu_env.max_samples));
    _mesa_blake3_final(&ctx, blake3);
 
    memcpy(uuid, blake3, VK_UUID_SIZE);

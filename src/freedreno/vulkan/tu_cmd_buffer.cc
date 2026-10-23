@@ -1344,6 +1344,7 @@ tu6_update_msaa(struct tu_cmd_buffer *cmd)
     */
    if (samples == 0)
       samples = VK_SAMPLE_COUNT_1_BIT;
+   samples = tu_clamp_samples(samples);
    tu6_emit_msaa<CHIP>(&cmd->draw_cs, samples, cmd->state.msaa_disable);
 }
 
@@ -8528,7 +8529,7 @@ tu_emit_fdm_params(struct tu_cmd_buffer *cmd,
 {
    STATIC_ASSERT(IR3_DP_FS(frag_invocation_count) == IR3_DP_FS_DYNAMIC);
    tu_cs_emit(cs, fs->fs.sample_shading ?
-              cmd->vk.dynamic_graphics_state.ms.rasterization_samples : 1);
+              tu_clamp_samples((VkSampleCountFlagBits) cmd->vk.dynamic_graphics_state.ms.rasterization_samples) : 1);
    tu_cs_emit(cs, cmd->vk.dynamic_graphics_state.ms.alpha_to_coverage_enable);
    tu_cs_emit(cs, 0);
    tu_cs_emit(cs, 0);
