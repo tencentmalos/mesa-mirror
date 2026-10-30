@@ -212,6 +212,13 @@ get_device_extensions(const struct tu_physical_device *device,
                       struct vk_device_extension_table *ext)
 {
    bool has_gralloc = vk_android_get_ugralloc() != NULL;
+   /* Android consumers (shadPS4's GPU profiler): KGSL has no implementation of
+    * device_get_gpu_timestamp. A persistent hardware counter alone is not enough
+    * to advertise host/device calibration; calling it reaches UNREACHABLE.
+    * Command-buffer timestamp queries remain supported independently.
+    */
+   const bool has_calibrated_timestamps =
+      device->info->props.has_persistent_counter && !is_kgsl(device->instance);
    /* device->has_raytracing contains the value of the SW fuse. If the
     * device doesn't have a fuse (i.e. a740), we have to ignore it because
     * kgsl returns false. If it does have a fuse, enable raytracing if the
@@ -227,7 +234,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_acceleration_structure = has_raytracing,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
-      .KHR_calibrated_timestamps = device->info->props.has_persistent_counter,
+      .KHR_calibrated_timestamps = has_calibrated_timestamps,
       .KHR_compute_shader_derivatives = true,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
@@ -325,7 +332,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_attachment_feedback_loop_dynamic_state = true,
       .EXT_attachment_feedback_loop_layout = true,
       .EXT_border_color_swizzle = true,
-      .EXT_calibrated_timestamps = device->info->props.has_persistent_counter,
+      .EXT_calibrated_timestamps = has_calibrated_timestamps,
       .EXT_color_write_enable = true,
       .EXT_conditional_rendering = true,
       .EXT_conservative_rasterization = device->info->chip >= 7,
